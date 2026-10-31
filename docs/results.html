@@ -1,0 +1,63 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AKL Cordon: what we found</title>
+<meta name="description" content="What the charge did to Auckland's simulated commuters, under a formula and under an AI.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/core.js" defer></script>
+<script src="assets/pages.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <div class="eyebrow">What we found</div>
+  <h1>A third of the cars vanished. Where did they go?</h1>
+  <p class="lede">Here is what the charge did, told twice: once with the formula deciding for every commuter, once with the AI. The charts are computed live from the simulation files; the maps are from the study.</p>
+
+  <div class="tiles" id="rs-tiles"></div>
+
+  <h2>The rush hour moved, or it shrank</h2>
+  <p class="prose">Before the charge, both versions of the city look the same. After it, they diverge. The formula-driven commuters dodge the NZ$6 hour by <b>leaving earlier</b>: between 6:30 and 7:30 there are about a third more cars than before, a brand-new mini rush hour. The AI-driven commuters don't bother retiming; they <b>leave the car at home</b>, so the roads get quieter at every hour. In the charged hour itself, both remove about the same number of cars, and the drivers who remain save two to seven minutes per trip.</p>
+  <div class="panel">
+    <p class="panel-title">More or fewer cars than before the charge, and longer or shorter delays</p>
+    <p class="panel-sub">Each bar compares the charged mornings (6 to 10) with the free mornings (2 to 5) at the same time of day. Above zero: more cars or more delay than before. Below: fewer.</p>
+    <div class="grid2"><div class="chart" id="rs-cross"></div><div class="chart" id="rs-delay"></div></div>
+  </div>
+
+  <h2>Who gave up the car, and who just left earlier</h2>
+  <div class="grid2">
+    <div class="panel"><p class="panel-title">How people travelled on the last free morning and the last charged one</p><div class="chart" id="rs-mode"></div></div>
+    <div class="panel"><p class="panel-title">When the remaining drivers leave home</p><p class="panel-sub">Share of car trips by departure time. Dashed is the last free morning, solid the last charged one. Watch the blue curve slide left.</p><div class="chart" id="rs-depart"></div></div>
+  </div>
+  <div class="panel">
+    <p class="panel-title">Which kinds of people changed the most?</p>
+    <p class="panel-sub">Fall in car trips after the charge, for different groups of commuters. Hover for the exact numbers; the count in brackets is how many commuters are in the group.</p>
+    <div class="ctls"><label class="ctl">Group people by <select id="rs-group"><option value="corridor_id">Where they come from</option><option value="archetype">Kind of job</option><option value="H">Strength of habit (1 to 5)</option><option value="F">Schedule flexibility (1 to 5)</option><option value="P">Openness to the bus (1 to 5)</option><option value="S">How much a charge annoys them (1 to 5)</option><option value="vot_quintile">How much they value their time</option></select></label></div>
+    <div class="chart" id="rs-group-chart"></div>
+  </div>
+
+  <h2>Which roads got better, and which got worse</h2>
+  <p class="prose">Fewer cars means less delay for everyone on the road, including the trucks, school runs and other trips the model keeps constant. After 8 am nearly every road improves in both versions. Before 8 am, the formula's early birds make things <b>worse</b> on the Southern Motorway and the inner approaches: 320 extra vehicle-hours of delay each morning on those roads. The AI version barely touches the early roads. Over the whole morning the charge saves the region 1,200 to 1,500 vehicle-hours, about 5% of all delay. Why so little? Commuters are only 13% of the traffic, and the motorways jam anyway.</p>
+  <figure><img src="assets/img/fig5_road_change.png" alt="Four maps of the change in delay on each road, formula and AI, before and after 8 am"><figcaption>Change in delay on each road after the charge. Red roads got worse, blue got better. Top row: 6 to 8 am. Bottom row: 8 to 10 am. Left: formula. Right: AI.</figcaption></figure>
+  <figure><img src="assets/img/fig6_delay_saved.png" alt="Bars of minutes saved per car trip, overall and on four named roads"><figcaption>Minutes saved per car trip. The biggest wins are on the inner-suburb arterials like Dominion Road; the motorways hardly change, because they are jammed by traffic the charge doesn't touch.</figcaption></figure>
+
+  <h2>The morning the trains broke down</h2>
+  <p class="prose">In a second scenario, buses and trains on the busiest side of town take twice as long on two mornings: one before the charge, one after it. Everyone is told in advance. The formula-driven riders mostly shrug and sit through the slow trip. The AI-driven riders are far more active: before the charge, many drive or work from home instead. After the charge, something interesting happens. When the AI moved people to the bus on the charge morning, most of them said “if the bus is disrupted, I'll drive”. On the disrupted morning that back-up plan kicks in without any new decision, and most of the former drivers are back in their cars for a day, charge or no charge. Nobody programmed that behaviour; it came from the AI's answers.</p>
+  <div class="panel">
+    <p class="panel-title">What the affected riders did on the two disrupted mornings</p>
+    <p class="panel-sub">People on the South-west side who rode the bus or train the morning before. Below each chart: how many were back on the bus the next day. (The study counts riders by their standing routine, so its numbers differ by a few people.)</p>
+    <div class="grid2"><div class="chart" id="rs-dis3"></div><div class="chart" id="rs-dis8"></div></div>
+  </div>
+
+  <h2>In the AI's own words</h2>
+  <p class="prose">Every time the AI decided for someone, it gave a reason. The reasons line up with the facts it was given, but its tastes are its own: it is quicker to give up the car for the bus than the formula, and it almost never retimes (“leaving earlier to save a couple of dollars isn't worth the hassle”). That's why the two results are best read as two plausible futures, not a forecast. Browse the 771 answers below.</p>
+  <div class="panel">
+    <div class="ctls"><label class="ctl">Show people who chose <select id="rs-sel"><option value="">anything</option><option value="PT">the bus or train</option><option value="WFH">to work from home</option><option value="CAR">to keep driving</option></select></label><label class="ctl">Search the answers <input type="search" id="rs-q" placeholder="for example: hassle, kids, parking"></label><span class="small muted" id="rs-count"></span></div>
+    <div class="scrollbox" id="rs-replies"></div>
+  </div>
+  <div class="note"><b>What this means for Auckland.</b> Prepare for both stories: watch the 6:30 to 7:30 traffic from week one, and make sure buses and trains can carry 3,400 to 4,800 extra morning passengers, reliably. A single bad morning on one line sent most of the AI's new bus riders back to their cars, though 93% were back on the bus the next day.</div>
+  <footer class="foot"></footer>
+</main>
+</body>
+</html>

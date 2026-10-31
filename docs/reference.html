@@ -1,0 +1,108 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AKL Cordon: under the hood</title>
+<meta name="description" content="Parameters, cost formulas, run files, the command line and what the website replicates.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/core.js" defer></script>
+<script src="assets/pages.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <div class="eyebrow">Under the hood</div>
+  <h1>For the curious: formulas, parameters and files</h1>
+  <p class="lede">This page is for readers who want to run or change the model. The code name of the model in the repository is Cordon-Lite. The full account, with its history and every design decision, is in <code>cordon_lite/README.md</code>, <code>INTERFACES.md</code> and <code>DEVIATIONS.md</code> on GitHub.</p>
+
+  <h2 id="layout">Repository layout</h2>
+  <div class="prose"><pre><code>cordon_lite/
+  config.toml             every parameter, each with a comment naming its source
+  cordonlite/             the model
+    run.py                orchestrator: personas, clock, deciders, engine, outputs
+    persona.py            Layer A constraints and Layer B dispositions
+    options.py            today's options and their generalised costs
+    clock.py              triggers T1 to T6 (and the optional periodic review T7)
+    rules.py              the rule decider (logit over generalised cost)
+    thinker.py            the H-clock LLM decider and its prompt
+    llm.py                the Anthropic client, cache and the L-arm prompt
+    roads.py              road sections, BPR speeds, motorway breakdown, level of service
+    engine.py             the gate queues (PyEngine) and the NetLogo twin
+    memory.py, fees.py, types.py, config.py, vickrey.py, analysis.py
+  prep/                   builds data/ from the Census, TomTom and the counts
+  data/                   prepared inputs and calibration files
+  runs/                   stored runs (one folder each) and runs/figures, runs/llm_behaviour
+  netlogo7/               the NetLogo 7 twin and GIS layers for its GUI
+  scripts/                calibration, chapter figures, LLM reports, this website's data export
+  tests/                  pytest suite</code></pre></div>
+
+  <h2 id="cli">Command line</h2>
+  <div class="prose"><pre><code>python3.12 -m venv .venv && .venv/bin/pip install -r requirements.txt
+python -m cordonlite.run --arm R-clock --seed 1                # a run: runs/R-clock_mock_py_s1
+python -m cordonlite.run --arm R-daily --peak-fee 18             # another charge: _peak18
+python -m cordonlite.run --arm R-clock --set events.pt_disruption_day=[3,8] --name R-clock_mock_py_s1_pt3_pt8
+python -m cordonlite.run calibrate --seeds 1 2 3                 # gate capacity -> data/calibration.json
+ANTHROPIC_API_KEY=... python -m cordonlite.run --arm H-clock --backend anthropic --seed 1
+python scripts/chapter_figures.py                                # runs/figures/chapter/
+python scripts/build_docs_site.py                                # the data behind this website
+python -m pytest</code></pre>
+  <p>Run folders are named <code>&lt;arm&gt;_&lt;backend&gt;_&lt;engine&gt;_s&lt;seed&gt;</code> plus a suffix for every setting that differs from <code>config.toml</code>. Outputs are byte-identical for identical inputs with the rule and either engine.</p></div>
+
+  <h2 id="gc">Generalised cost</h2>
+  <div class="prose">
+    <p>With a = VoT/60 (NZ$ per minute), k = kappa_H (halved at a discontinuity wake), phi, omega and eta the disposition multipliers, and the standing option the routine:</p>
+    <pre><code>CAR at departure d
+  R   = public road delay on the route when leaving at d (yesterday's traffic; usual traffic on morning 1)
+  g   = d + free-flow minutes to the gate + floor(R + 0.5)          expected gate arrival
+  D   = public queue delay at g (yesterday, 5-min bins) x personal delay ratio (EMA)
+  x   = g + round(D)                                                 expected crossing minute
+  arr = x + free-flow minutes from the gate to work
+  time     = a x (free-flow total + R + D)
+  schedule = phi x sched_mult x a x (0.61 x early + 2.38 x late)     against the cheaper of t* and the 07:00 start (+ NZ$3 x phi)
+  fee      = f(x) + eta x max(0, f(x) - reference fee)               0 for a company car
+  parking  = daily parking;  fuel = 2 x km x NZ$0.30
+  habit    = k if d is not the standing departure
+PT
+  pt       = omega x (a x T_pt + PAP) + fare,  T_pt = 1.6 x free-flow car time + 10 (x2 when disrupted)
+  schedule = phi x sched_mult x a x 0.61 x early                     latest 10-min service arriving by the start
+  habit    = k unless PT is the routine
+WFH
+  wfh      = k_WFH x phi + a x free-flow total + parking + fuel      (no commute, parking or fuel credit)
+  habit    = k unless WFH is the routine
+Choice: argmin over options of GC - Gumbel(0, NZ$0.50)
+Willingness to pay: WTP = -ln(u) x VoT / beta, beta = clip(0.15 x 9.97 / VoT, 0.1, 2); a car option with f(x) > WTP is not offered</code></pre>
+  </div>
+
+  <h2 id="params">Parameters</h2>
+  <p class="prose">Read from <code>config.toml</code> and <code>data/road_meta.json</code> when the site data was built.</p>
+  <div class="tablewrap"><table id="rf-params"><thead><tr><th>Group</th><th>Key</th><th>Value</th><th>Meaning</th></tr></thead><tbody></tbody></table></div>
+  <h3>Disposition levels</h3>
+  <div class="tablewrap"><table id="rf-traits"><thead><tr><th>Trait</th><th>Parameter</th><th class="n">1</th><th class="n">2</th><th class="n">3</th><th class="n">4</th><th class="n">5</th><th>Share of commuters at each level</th></tr></thead><tbody></tbody></table></div>
+
+  <h2 id="files">Run outputs</h2>
+  <div class="tablewrap"><table>
+    <thead><tr><th>File</th><th>One row per</th><th>Main columns</th></tr></thead><tbody>
+    <tr><td><code>personas.csv</code></td><td>agent</td><td>origin, corridor, free-flow times, VoT, archetype, t*, PT and WFH feasibility, parking, fuel, H F P S, willingness to pay</td></tr>
+    <tr><td><code>decisions.csv</code></td><td>agent x morning</td><td>option chosen, decider (rule, llm, standing, forced), triggers, reason, factors, generalised cost and its rank, start used</td></tr>
+    <tr><td><code>outcomes.csv</code></td><td>agent x morning</td><td>mode, departure, road delay, gate arrival and exit, queue delay, arrival, early and late minutes, charge, parking, fuel, fare</td></tr>
+    <tr><td><code>plans.csv</code></td><td>agent x morning</td><td>what the engine was given: mode and departure</td></tr>
+    <tr><td><code>profile.csv</code></td><td>corridor x minute x morning</td><td>arrivals, served, queue length at the gate</td></tr>
+    <tr><td><code>road_entries.csv</code></td><td>section x minute x morning</td><td>commuter cars entering the section</td></tr>
+    <tr><td><code>road_los.csv</code>, <code>los_summary.csv</code></td><td>section x period, morning x bin</td><td>volume/capacity, speed, level of service by V/C and by speed</td></tr>
+    <tr><td><code>llm_calls.jsonl</code>, <code>plan_log.jsonl</code></td><td>call; agent x morning</td><td>every prompt and reply; who answered and the arrangement whenever it changed (H-clock)</td></tr>
+    <tr><td><code>summary.json</code></td><td>run</td><td>settings, capacity, calls by type, per-morning summaries, LLM token counts</td></tr>
+    </tbody></table></div>
+
+  <h2 id="site">What this website does, and does not, reproduce</h2>
+  <div class="prose">
+    <ul>
+      <li><b>Replay and results</b> read the stored runs exported by <code>scripts/build_docs_site.py</code>: modes, departures, gate times, delays, charges and every logged reason. Positions along a route are interpolated by free-flow time between a car's departure and gate arrival, which is a drawing convenience: the engine computes only the total road delay, not where on the route it was lost.</li>
+      <li><b>Run it yourself</b> runs the repository's Python in the browser, unmodified. Only the rule arms run there; the H-clock arm needs the Claude API. Each browser run is hashed and compared with the stored run of the same settings, and the match is reported.</li>
+      <li><b>The cost explorer</b> re-implements the generalised cost of <code>options.py</code> in JavaScript. It is checked against the Python values for every commuter and option on morning 6 when the page loads, and the largest difference is reported next to the explorer.</li>
+      <li>The NetLogo twin, the level-of-service outputs and the calibration searches are not replicated here.</li>
+    </ul>
+  </div>
+  <footer class="foot"></footer>
+</main>
+</body>
+</html>

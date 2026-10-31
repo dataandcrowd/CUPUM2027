@@ -1,0 +1,132 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>How AKL Cordon works</title>
+<meta name="description" content="Meet the simulated commuters, see what wakes them up, and play with the cost of their choices.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/core.js" defer></script>
+<script src="assets/pages.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <div class="eyebrow">How it works</div>
+  <h1>A small city, built one commuter at a time</h1>
+  <p class="lede">Here is the model in plain words, piece by piece. Every chart on this page is drawn from the real simulation files, so what you see is what the model did.</p>
+
+  <div class="glossary">
+    <div><b>Cordon</b><br>The boundary around Auckland's city centre. Cross it by car in the morning and you pay.</div>
+    <div><b>Agent</b><br>One simulated commuter: a home, a job, a car, a personality, and a memory.</div>
+    <div><b>Rule</b><br>A formula that picks the cheapest option, counting time as money.</div>
+    <div><b>LLM</b><br>A large language model (here, Claude): an AI that reads a description and answers in words.</div>
+  </div>
+
+  <h2 id="area">Where it all happens</h2>
+  <div class="split">
+    <div class="prose">
+      <p>The destination is Auckland's city centre, the shaded area on the map. The commuters live all over the region. Their homes come from the 2023 Census, which records where people live and where they drive to work. Their routes follow the real major-road network, and each route enters the city centre at one of 23 <b>gates</b>, grouped into five directions of approach.</p>
+      <p>The roads carry everyone else too: the model adds the real traffic counts of each road, so our commuters are only about 13% of the cars on their routes. Motorways jam the way they really do in the morning, with timings taken from NZTA's counting stations.</p>
+      <table><thead><tr><th>What</th><th>Where it comes from</th></tr></thead><tbody>
+        <tr><td>Roads and speeds</td><td>TomTom's road network</td></tr>
+        <tr><td>Where commuters live</td><td>2023 Census (Stats NZ)</td></tr>
+        <tr><td>Everyday traffic on each road</td><td>Auckland Transport and NZTA counts</td></tr>
+        <tr><td>When motorways jam</td><td>NZTA counting stations, 36 sites</td></tr>
+        <tr><td>How congested Auckland mornings are</td><td>TomTom Traffic Index 2025</td></tr>
+        <tr><td>How many cars enter the centre</td><td>Auckland Transport's charging proposal: 19,000</td></tr>
+      </tbody></table>
+    </div>
+    <figure><img src="assets/img/fig1_study_area.png" alt="Map of Auckland showing commuter homes, the simulated roads and the city-centre cordon with its 23 gates in five groups"><figcaption>(a) Where the commuters live (orange) and the roads they use (blue). (b) The city centre, its boundary, and the 23 gates where cars are charged.</figcaption></figure>
+  </div>
+
+  <h2 id="agents">Meet the commuters</h2>
+  <div class="prose">
+    <p>Each of the 950 commuters is made of three layers.</p>
+    <p><b>Their situation.</b> Where they live, which fixes their route and how long it takes with no traffic. How much they value their time (some people would pay a lot to save ten minutes, others not). What kind of job: office worker who can work from home, office worker who can't, shift worker, tradesperson with a work van, or student. When they have to be at work, whether the bus is realistic, whether they pay for parking, and the most they would ever pay to drive in.</p>
+    <p><b>Their personality.</b> Four dials, each from 1 to 5: how strong their habits are, how flexible their schedule is, how open they are to public transport, and how much a new charge annoys them beyond its dollar value.</p>
+    <p><b>Their memory.</b> What they did each morning, how long it took, whether they were late, what they paid. The last 95 commuters are <b>twins</b> of the first 95: identical situations, different personalities, so we can see what personality alone changes.</p>
+  </div>
+  <div class="panel">
+    <p class="panel-title">The 950 commuters at a glance</p>
+    <p class="panel-sub">Hover over any bar for the count.</p>
+    <div class="grid3"><div class="chart" id="p-vot"></div><div class="chart" id="p-arch"></div><div class="chart" id="p-corr"></div><div class="chart" id="p-tstar"></div><div class="chart" id="p-traits"></div><div class="chart" id="p-wtp"></div></div>
+  </div>
+
+  <h2 id="options">What does each choice cost?<span class="live">Play with it</span></h2>
+  <div class="prose">
+    <p>Every morning a commuter has a menu: drive at their usual time or up to an hour earlier or later, take the bus or train, or work from home if they can. The formula turns each option into a single number in dollars: the time it takes (valued at that person's hourly rate), the pain of arriving early or late, the charge, parking, fuel, how much they dislike the bus, and a “habit cost” for anything that isn't what they did yesterday. Then it picks the cheapest, with a little randomness so people aren't robots.</p>
+    <p>On a charged morning there is one more rule: if a departure time would cost more than the most this person would ever pay, it is simply removed from the menu.</p>
+  </div>
+  <div class="panel">
+    <p class="panel-title">Cost explorer: the first charged morning</p>
+    <p class="panel-sub">Pick any commuter. Each bar is what one option “costs” them in dollars, all things considered, on morning 6. Drag the slider to change the charge and watch the cheapest option move. Grey bars are options that this person would refuse to pay for at that charge.</p>
+    <div class="ctls">
+      <label class="ctl">Commuter number (0 to 949) <input type="number" id="ce-agent" min="0" max="949" value="6" style="width:110px"></label>
+      <button id="ce-random">Pick someone at random</button>
+      <label class="ctl" style="flex:1 1 200px">Peak charge NZ$<span id="ce-fee-v">6</span><input type="range" id="ce-fee" min="0" max="30" step="1" value="6"></label>
+    </div>
+    <div class="split">
+      <div class="personacard" id="ce-persona"></div>
+      <div><div class="chart" id="ce-chart"></div><p class="small muted" id="ce-note"></p></div>
+    </div>
+  </div>
+  <div class="try"><b>Try this:</b> find a commuter whose cheapest option flips from driving to the bus somewhere between NZ$6 and NZ$12. Then find one who keeps driving even at NZ$30, and look at their value of time and their options.</div>
+
+  <h2 id="clock">The alarm clock in every commuter's head</h2>
+  <div class="prose">
+    <p>This is the heart of the model. Each commuter has six alarms. When one rings, they stop and decide. When none rings, they do exactly what they did yesterday, without any decision at all. Each alarm rings only once per event: a new charge makes you think on the day it starts, not every day after.</p>
+    <table><thead><tr><th>Alarm</th><th>It rings when…</th></tr></thead><tbody>
+      <tr><td>T1</td><td>It's the very first morning and you have no routine yet</td></tr>
+      <tr><td>T2</td><td>The charge starts, or changes</td></tr>
+      <tr><td>T3</td><td>You were late yesterday, by more than you're willing to tolerate (5 to 15 minutes, depending on how flexible you are)</td></tr>
+      <tr><td>T4</td><td>Your bus or train was disrupted yesterday, or a disruption is announced for today (and once more when it's over)</td></tr>
+      <tr><td>T5</td><td>Your drive was more than 20% longer or shorter than you expected, two days running</td></tr>
+      <tr><td>T6</td><td>Your usual choice isn't on the menu today, for instance because the charge at that time is more than you'd pay</td></tr>
+    </tbody></table>
+    <p>Habit is a cost of change. When the alarm is about a change in your surroundings (T1, T4, T6) that cost is halved: psychologists call this the “habit discontinuity” effect, the moment a routine breaks and people become open to new ones. A price change alone (T2) does not break the habit in the same way.</p>
+  </div>
+  <div class="panel">
+    <p class="panel-title">Who stopped to think, and when</p>
+    <p class="panel-sub">Decisions made each morning in three versions of the experiment. Everyone decides on morning 1. On morning 6 the charge wakes almost everyone. In between, almost nobody. Compare that with the old-fashioned way on the left, where every person decides every single day.</p>
+    <div class="grid3"><div class="chart" id="w-rdaily"></div><div class="chart" id="w-rclock"></div><div class="chart" id="w-hclock"></div></div>
+    <div class="chart" id="w-trig" style="margin-top:14px"></div>
+  </div>
+
+  <h2 id="deciders">Two kinds of brain</h2>
+  <div class="grid2">
+    <div class="panel" style="border-top:5px solid var(--rule)">
+      <p class="panel-title">The formula (“the rule”)</p>
+      <p>Adds up the costs above and picks the cheapest option. It was tuned so that, before the charge, about 85% of commuters drive, and so that the charge cuts car trips by roughly a fifth, which is what happened in Stockholm. It explains itself in a fixed sentence:</p>
+      <p class="small" id="rule-example" style="font-style:italic"></p>
+    </div>
+    <div class="panel" style="border-top:5px solid var(--llm)">
+      <p class="panel-title">The AI (“the LLM”)</p>
+      <p>Gets a letter, written to “you”: your situation, your personality in four sentences, what you've been doing and how it went, and what has changed. It never sees the formula or any dollar total. It answers with a new routine, a back-up plan for a disrupted morning, and a reason in its own words. Day 1 is set by the formula, so both versions start from identical habits. For example:</p>
+      <p class="small" id="llm-example" style="font-style:italic"></p>
+    </div>
+  </div>
+  <div class="note"><b>Three experiments, three names.</b> <b>R-daily</b>: the formula decides for everyone, every day (the traditional way). <b>R-clock</b>: the same formula, but only when an alarm rings. <b>H-clock</b>: the AI, only when an alarm rings. R-daily vs R-clock shows what the alarm clock changes; R-clock vs H-clock shows what the AI changes.</div>
+
+  <h2 id="traffic">The roads, the jams and the gates</h2>
+  <div class="split">
+    <div class="prose">
+      <p>A car's morning has three parts. First the drive in: the route is cut into short road sections, and each section slows down as it fills with the day's traffic plus our commuters. Leave at 7:45 and the same road takes longer than at 6:30. Motorways jam the way Auckland's really do, down to 45% of their normal speed for hours.</p>
+      <p>Then the <b>gate</b>: at the city-centre boundary cars queue, like at a toll booth, and the queue stands in for the city-centre congestion. Finally the last stretch to work, which is short and free-flowing.</p>
+      <p>The bus or train takes a fixed time: 1.6 times the no-traffic drive plus 10 minutes. Things like choosing a different road, traffic lights and rat-running are deliberately left out, so that any difference between the formula and the AI comes from the decisions, not from the roads.</p>
+    </div>
+    <div>
+      <div class="panel"><p class="panel-title">What the charge is, minute by minute</p><p class="panel-sub">NZ$4 from 6 am, NZ$6 between 8 and 9, back to NZ$4 after 9:30. Higher “peak” settings scale the whole curve up.</p><div class="chart" id="t-fee"></div></div>
+      <div class="panel"><p class="panel-title">How much slower the drive is, by departure time</p><p class="panel-sub">Average over all commuters of the extra minutes their route takes compared with empty roads. This is what everyone “knows” on morning 1.</p><div class="chart" id="t-road"></div></div>
+    </div>
+  </div>
+  <figure><img src="assets/img/fig3_netlogo_gates.png" alt="A NetLogo view of the city centre with cars queuing at the five gate groups" style="max-width:520px"><figcaption>The same model also runs in NetLogo, a classic agent-based modelling tool. Here it shows cars queuing at the gates: 11 waiting at Fanshawe Street, 10 at the Northern Motorway ramp. The <a href="replay.html">Watch a morning</a> page shows the same thing in your browser.</figcaption></figure>
+
+  <h2 id="calibration">How do we know the numbers are reasonable?</h2>
+  <div class="prose">
+    <p>Road congestion was tuned until a typical 8 am drive took 1.71 times as long as an empty-road drive, which is Auckland's score in the TomTom Traffic Index. The gate queues were tuned so that the worst 15 minutes before the charge cost drivers about 15 minutes. Then three dials of the formula were tuned so that, before the charge, 75 to 85% of commuters drive and 8 to 15% take the bus, and so that the charge cuts car trips by 15 to 30%, around Stockholm's 20%. The AI was never tuned: it just answers as it sees fit.</p>
+    <p>Checks: using 950 commuters instead of all 19,000 changes the results by only 1 to 2%. The rule about the most a person would pay matters most (without it, car trips fall 16%; with a stronger version, 33%). Giving everyone a middle-of-the-road personality makes the formula's reaction stronger (30% instead of 23%).</p>
+  </div>
+  <footer class="foot"></footer>
+</main>
+</body>
+</html>

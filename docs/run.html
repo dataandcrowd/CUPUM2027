@@ -1,0 +1,56 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AKL Cordon: try it yourself</title>
+<meta name="description" content="Run the real simulation in your browser. Change the charge, the people, the trains, and see what happens.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/core.js" defer></script>
+<script src="assets/pages.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <div class="eyebrow">Try it yourself<span class="live">Runs in your browser</span></div>
+  <h1>You are now the transport planner</h1>
+  <p class="lede">This page loads the real model, the same Python code the researchers ran, into your browser. Nothing is sent anywhere. Choose a charge, a set of people and a scenario, press the button, and ten mornings of Auckland traffic happen in a few seconds.</p>
+
+  <div class="panel">
+    <div class="ctls">
+      <label class="ctl">Who decides <select id="rn-arm"><option value="R-clock">The formula, only when an alarm rings</option><option value="R-daily">The formula, every person every day</option></select></label>
+      <label class="ctl">Which 950 people <select id="rn-seed"><option>1</option><option>2</option><option>3</option><option>4</option><option>5</option><option>7</option><option>11</option></select></label>
+      <label class="ctl">Peak charge NZ$ <select id="rn-fee"><option>0</option><option>3</option><option selected>6</option><option>9</option><option>12</option><option>18</option><option>30</option></select></label>
+      <label class="ctl">Personalities <select id="rn-traits"><option value="on">As varied as real people</option><option value="off">Everyone average</option></select></label>
+      <label class="ctl">Train disruption <select id="rn-pt"><option value="0">None</option><option value="1">South-west side, mornings 3 and 8</option></select></label>
+      <button class="primary" id="rn-go" disabled>Loading Python…</button>
+    </div>
+    <div class="progress"><i id="rn-bar"></i></div>
+    <p class="small muted" id="rn-status">Starting.</p>
+  </div>
+  <div class="try"><b>Ideas to try:</b> set the charge to NZ$0 to see a normal week, then NZ$30 to see what London-level prices would do. Pick a different set of people (the “seed”) to see how much luck matters. Set everyone to “average” and see whether varied personalities soften or sharpen the reaction. The AI version needs an API key, so it can't run here; its results are on the other pages.</div>
+
+  <div id="rn-out" hidden>
+    <div class="tiles" id="rn-tiles"></div>
+    <p class="small muted" id="rn-check"></p>
+    <div class="grid2">
+      <div class="panel"><p class="panel-title">How people travelled, morning by morning</p><div class="chart" id="rn-mode"></div></div>
+      <div class="panel"><p class="panel-title">How many people stopped to think each morning</p><p class="panel-sub">Everyone else did what they did yesterday, or had only the bus left.</p><div class="chart" id="rn-woken"></div></div>
+      <div class="panel"><p class="panel-title">Cars entering the city centre, before and after the charge</p><p class="panel-sub">Average of mornings 2 to 5 versus mornings 6 to 10.</p><div class="chart" id="rn-cross"></div></div>
+      <div class="panel"><p class="panel-title">Minutes lost to traffic and queuing per car trip</p><p class="panel-sub">By the time the car crossed into the centre. Average of mornings 2 to 5 versus 6 to 10.</p><div class="chart" id="rn-delay"></div></div>
+    </div>
+    <div class="panel"><p class="panel-title">Your run on the map</p><p class="panel-sub">Press Play to watch the mornings you just simulated.</p><div id="rn-replay"></div></div>
+    <div class="panel"><p class="panel-title">Everything you've run so far</p><div class="tablewrap"><table id="rn-table"><thead><tr><th>Who decides</th><th>People</th><th class="n">Peak NZ$</th><th>Personalities</th><th>Trains</th><th class="n">Driving before</th><th class="n">Driving after</th><th class="n">Change in car trips</th><th class="n">Delay before (min)</th><th class="n">After</th><th class="n">Decisions</th><th>Same as the researchers' run?</th></tr></thead><tbody></tbody></table></div></div>
+  </div>
+
+  <h2>What exactly is running?</h2>
+  <div class="prose">
+    <p>The page downloads a Python interpreter that runs inside your browser (a project called Pyodide), then the model's own code, settings and input data, unchanged. When you press the button it calls the very same function the researchers call from their command line. The only difference is the versions of the number-crunching libraries, so every run is fingerprinted and compared with the researchers' stored run of the same settings. “Same as the researchers' run” means every person's choice, departure time and gate-crossing minute matched exactly.</p>
+    <p>If you'd rather run it on your own computer, the whole thing is on <a href="https://github.com/dataandcrowd/CUPUM2027">GitHub</a>:</p>
+    <pre><code>cd cordon_lite
+python -m cordonlite.run --arm R-clock --seed 1 --peak-fee 6
+python -m cordonlite.run --arm R-daily --seed 2 --peak-fee 18 --traits off --set events.pt_disruption_day=[3,8]</code></pre>
+  </div>
+  <footer class="foot"></footer>
+</main>
+</body>
+</html>

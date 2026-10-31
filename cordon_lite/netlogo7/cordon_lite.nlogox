@@ -1,0 +1,3194 @@
+<?xml version="1.0" encoding="utf-8"?>
+<model version="NetLogo 7.0.4" snapToGrid="false">
+  <code><![CDATA[;; Cordon-Lite NetLogo model. One file, two uses:
+;;  - Open it to watch a run: every car drives on the TomTom major-road network of Auckland from its
+;;    origin to its gate, waits in the gate queue and parks at its workplace in the city centre. The
+;;    model plays each morning until every commuter has arrived (1 tick = 15 simulated seconds).
+;;  - Python drives it headless as NetLogoEngine (cordonlite/engine.py) through setup-from-dir,
+;;    set-clock and run-day, exchanging CSV files with a run folder; that path loads no map.
+;; Both uses compute the day with the same two procedures, identical to PyEngine: road-arrivals (the
+;; congested roads from home to the gate, cordonlite/roads.py simulate_roads) and point-queues (one
+;; Vickrey point queue per corridor at minute resolution).
+;;
+;; Each commuter lives at its Cordon-Lite origin and works in one building inside the cordon, drawn
+;; at random once (fixed seed) and kept for every day. On each day (the day's rows of plans.csv in a run folder)
+;; a car leaves home at its departure minute, drives the free-flow shortest path to its gate (the
+;; prep gate of its origin: where its path first enters the cordon), waits in its corridor's queue
+;; and drives on to its building. The minutes are the engine's: gate arrival = departure + free-flow
+;; minutes to the gate (agents.csv) + road delay (road-arrivals: traffic on the way, 0 without the
+;; road files); gate exit from point-queues (the same FIFO order, carry and cap as PyEngine, so the
+;; same minutes); arrival = gate exit + free-flow minutes from the gate. The network only says where
+;; a car is between those minutes (before the gate it follows its section times from road-arrivals,
+;; plan-drives). PT riders leave home and appear at their building at the PT arrival minute of the
+;; run (outcomes.csv); WFH commuters stay at home. The road network is drawn as its links (roads), and
+;; the roads on the commuters' routes are coloured by how fast their traffic moves, every 5 minutes
+;; (update-road-colours). Nothing here feeds back into
+;; a Cordon-Lite run.
+;;
+;; Inputs, relative to this model:
+;;   experiment       the run folder of python -m cordonlite.run behind the experiment picked in the chooser (corridors.csv,
+;;                    agents.csv, fees.csv, plans.csv, scenario.csv, personas.csv, outcomes.csv;
+;;                    road_sections.csv, agent_routes.csv, road_profile.csv, road_params.csv when roads
+;;                    are congested). The scripts set up any folder with setup-run "<path>".
+;;   gis/tomtom_major_roads.shp, gis/cordon.shp, gis/cbd_buildings.shp, gis/cbd_buildings.csv
+;;                                                     map layers (prep.build_netlogo_layers)
+;;   ../data/origins.csv, ../data/gates.csv            prep outputs: the gate of every origin
+;;   ../data/section_segments.csv                      prep.build_roads: the TomTom segments of each
+;;                                                     road section (road colours)
+
+extensions [ csv table gis nw ]
+
+globals [
+  ;; scenario (a run folder of python -m cordonlite.run)
+  scen-dir            ;; folder loaded by setup
+  sim-start-min       ;; first minute simulated
+  sim-end-cap-min     ;; last minute a queue is served
+  corr-ids            ;; corridor ids, ascending
+  corr-caps           ;; capacity (cars per minute), same order
+  corr-names          ;; corridor names, same order
+  corr-xy             ;; [x y] NZTM of each corridor, same order
+  corr-index          ;; table corridor_id -> position in the lists above
+  agent-fg            ;; table agent_id -> free-flow minutes origin to gate
+  agent-gd            ;; table agent_id -> free-flow minutes gate to destination
+  commuter-of         ;; table agent_id -> commuter
+  agent-corr          ;; table agent_id -> corridor_id
+  fee-list            ;; 1440 fees by minute (fees.csv)
+  charge-from-day     ;; from scenario.csv: first charged day (0 = never; 11 without the file)
+  scen-n-days         ;; from scenario.csv: number of days in the run; -1 = unknown (no scenario.csv)
+  charge-on           ;; which days go plays: "all days" (setup-run sets it; no widget), "off: before the charge" or "on: with the charge" (the check scripts set them)
+  pt-times            ;; table "day agent_id" -> [depart arrive] of PT trips (outcomes.csv of a run)
+  day-plans           ;; table day -> the plans of that day, header row first (plans.csv of a run; empty without it)
+  ;; the day on screen
+  current-day         ;; 0 before the first day
+  day-running?        ;; a day is being animated
+  clock               ;; minutes after midnight
+  day-start           ;; first minute shown today
+  day-end-min         ;; the day ends at this minute (the last arrival)
+  vehicles-per-agent  ;; real cars one agent stands for (agents_represented / agents)
+  fee-active-today?   ;; charge levied today
+  n-cars              ;; cars today
+  mean-delay          ;; mean queue delay (min) of today's served cars
+  max-delay           ;; max queue delay (min) today
+  day-exits           ;; gate-exit minutes of today's served cars (cordon entries)
+  last-plot-min       ;; last minute plotted today
+  ;; headless engine (run-day, NetLogoEngine): the last day computed
+  agent-mode          ;; table agent_id -> mode
+  last-minute         ;; last minute processed
+  last-profile        ;; rows [day corridor_id minute arrivals served queue_len]
+  last-exits          ;; gate-exit minutes of the served cars
+  last-road           ;; rows [day section_id minute entries] (road_dayNN.csv)
+  ;; roads from home to the gate (read-roads; PyEngine: cordonlite/roads.py)
+  road-on?            ;; the road files were read; false = free-flow roads (road delay 0)
+  sec-ids             ;; road section ids, ascending
+  sec-index           ;; table section_id -> position in the section lists below
+  sec-ff              ;; free-flow minutes of each section
+  sec-cap             ;; capacity (veh/h, one direction)
+  sec-bg              ;; background peak-hour flow (veh/h)
+  sec-obs             ;; observed peak-hour flow (veh/h: background + usual commuters)
+  sec-w               ;; commuter weight (w_factor)
+  sec-fpe             ;; veh/h that one commuter entry adds while it is in the flow window
+  agent-route         ;; table agent_id -> section positions of its route to the gate, from home
+  road-r              ;; 1440 values of the default time profile (profile 0) by minute (share of the peak-hour flow)
+  road-profiles       ;; table profile_id -> 1440 time-profile values by minute (0 = default; NZTA sites 1..)
+  sec-r               ;; time profile (list of 1440) of each section (its profile_id; profile 0 without the column)
+  road-alpha          ;; BPR alpha (beta is 4)
+  road-floor          ;; lowest speed factor
+  road-window         ;; flow window (min): commuter entries counted at minutes m - window .. m - 1
+  road-vpa            ;; real cars one agent stands for (road_params.csv vehicles_per_agent)
+  ;; motorway flow breakdown (road_params.csv mwy_* keys; off without them)
+  mwy-on?             ;; the breakdown rule is on
+  sec-mwy             ;; 1 = motorway mainline section, 0 = other
+  sec-bd-on           ;; usual-traffic breakdown window [bd-on, bd-off) of each section (-1 -1 = none)
+  sec-bd-off
+  mwy-vc              ;; V/C at which motorway flow breaks down (today's traffic)
+  mwy-keep            ;; 1 - capacity drop of broken-down flow (road_params.csv mwy_capacity_drop)
+  sec-keep            ;; 1 - capacity drop of each section (cap_drop column; mwy-keep without it), computed once
+  mwy-jam             ;; highest speed factor in broken-down flow
+  today-road          ;; road-arrivals result of the day on screen ([] before the first day)
+  ;; road colours (GUI): traffic speed on the sections of the commuters' routes
+  sec-links           ;; road links (TomTom segments) of each section, sec-ids order
+  sec-frc             ;; TomTom frc of each section (0 = motorway)
+  sec-order           ;; section positions in drawing order: local roads first, motorways last
+  speed-grade         ;; grade of each section at grade-minute, from its speed (section-grade):
+                      ;; 0 = normal, 1 = slow, 2 = heavy, 3 = jammed (or a broken-down motorway)
+  grade-minute        ;; minute of those grades (a multiple of 5; -1 = grade again)
+  grade-shown         ;; grade each section is drawn in on the map
+  grade-pending       ;; sections whose colour on the map is not their grade's yet (recoloured on the next tick)
+  grade-entries       ;; today's commuter entries by minute: item (m - grade-first-min) = [[i n] ...],
+                      ;; n entries of the section at position i at minute m
+  grade-first-min     ;; minute of the first item of grade-entries
+  ;; Level of Service (GUI monitors and plot; cordonlite/roads.py los_at_minute), from the same pass
+  sec-km              ;; vehicle-km weight of each section: km of ../data/road_sections.csv (sec-ff without it)
+  sec-los-mwy         ;; LoS bands of each section: 1 = motorway (mwy of ../data/road_sections.csv), 0 = other
+  los-grade           ;; LoS grade of each section at grade-minute: 0..5 = A..F
+  los-ef-mwy          ;; share of motorway traffic (volume x km) at LoS E or F at grade-minute (-1 = none)
+  los-ef-other        ;; the same on other roads
+  los-vc-mwy          ;; mean V/C (volume x km weighted) of motorways at grade-minute (-1 = none)
+  los-vc-other        ;; the same on other roads
+  los-speed-grade     ;; speed-based LoS grade of each section at grade-minute: 0..5 = A..F
+  los-efs-mwy         ;; share of motorway traffic (volume x km) at speed-based LoS E or F at grade-minute (-1 = none)
+  los-efs-other       ;; the same on other roads
+  sec-region          ;; region of each section (index in los-region-names; the plots' pens), from its street name and position
+  los-region-ef       ;; share of each region's traffic (volume x km) at LoS E or F at grade-minute (-1 = none)
+  los-region-vc       ;; mean V/C (volume x km weighted) of each region at grade-minute (-1 = none)
+  los-mark            ;; last 5-minute mark plotted on the LoS E/F and mean V/C plots today (-1 = none)
+  ;; map and network
+  map-view            ;; "Auckland" | "City centre"
+  map-env             ;; [minx maxx miny maxy] NZTM of the world edges (gis:world-envelope)
+  roads-ds            ;; GIS datasets
+  cordon-ds
+  buildings-ds
+  main-inner          ;; the largest connected set of cordon nodes (roads with both ends inside)
+  node-at             ;; table "X Y" (NZTM rounded to 1 m) -> node
+  seg-ends            ;; table gate segment_id -> [node node]
+  seg-road            ;; table segment_id -> the road link it is drawn as (nobody: not in the network)
+  route-cache         ;; table "who who" -> list of nodes
+]
+
+;; breeds declared later are drawn on top
+breed [ nodes node ]
+undirected-link-breed [ roads road ]
+breed [ buildings building ]
+breed [ gates gate ]
+breed [ commuters commuter ]
+breed [ bus-riders bus-rider ]   ;; today's public transport riders, drawn as buses (one per commuter on PT today)
+breed [ tags tag ]               ;; corridor labels, drawn above gates and cars
+bus-riders-own [ rider ]          ;; the commuter this bus stands for today
+tags-own [ tag-cid ]             ;; the corridor a tag labels
+nodes-own [ node-x node-y in-cordon? in-view? ]   ;; NZTM metres rounded to 1 m, as the prep graph; in the current view
+roads-own [
+  free-flow-minutes                  ;; free-flow minutes = distance / speed limit (the prep weight)
+  cordon-routing-minutes               ;; free-flow-minutes + cordon-exit-penalty on a road with an end outside the cordon
+  road-frc                           ;; TomTom frc (0 motorway .. 4 local), the highest class of its segments
+  road-secs                          ;; positions of the sections on it (both directions of a street), [] = none
+]
+buildings-own [ building-id building-x building-y bnode ]   ;; point inside the footprint; nearest node in the cordon
+gates-own [ gate-id corridor-id gate-x gate-y outside-node inside-node ]   ;; gate point; outside and inside end node
+commuters-own [
+  agent-id corridor-id home-x home-y home-node my-gate work-building
+  route-out len-out   ;; NZTM [x y] points home -> gate point, and cumulative metres
+  route-out-minutes              ;; free-flow minutes from home to each point of route-out (at the gate point:
+                      ;; to the inside end of the gate segment, as the engine's route)
+  route-in len-in     ;; NZTM [x y] points gate point -> building, and cumulative metres
+  mode-today dep gate-arr gate-exit arr   ;; today's trip in minutes (-1 = none)
+  road-delay          ;; today's road delay (whole minutes; -1 = not driving today)
+  t-out               ;; minute at which today's car passes each point of route-out (plan-drives)
+  out-ptr             ;; the route-out point the car passed last (place-now)
+  q-rank              ;; place in the queue at its gate (0 = head)
+]
+
+;; ------------------------------------------------------------------ constants
+
+to-report roads-file
+  report path-join map-dir "tomtom_major_roads.shp"
+end
+
+to-report map-dir
+  report "gis"
+end
+
+to-report prep-dir
+  report "../data"
+end
+
+to-report workplace-seed
+  report 2027
+end
+
+;; animation steps per simulated minute: 1 tick = 15 s, so cars move smoothly
+to-report steps-per-minute
+  report 4
+end
+
+;; Road length one queued agent takes up, metres. An agent stands for vehicles-per-agent cars (about
+;; 20 in a 950-agent run); at 7 m per car in 2 lanes [A] that is about 70 m, so a queue drawn back
+;; along the approach road is as long as the real queue it stands for.
+to-report queue-spacing-m
+  report max (list 15 (vehicles-per-agent * 7 / 2))
+end
+
+;; size (patches) of a moving car in each view: large, so a car is easy to follow
+to-report car-size [ cc? ]
+  report ifelse-value cc? [ 4 ] [ 2.5 ]
+end
+
+;; size (patches) of a queued car in the current view. The car shape is 0.9 of its size long, so at
+;; this size a queued car covers 80% of the road it takes up (queue-spacing-m) and the cars of a
+;; queue stand apart (at 950 agents: 70 m per car, 1.9 patches in the City-centre view, where a
+;; moving car is 4 patches, about 150 m, long). Never larger than a moving car, nor smaller than 1.5
+;; patches (about 7 pixels), so it stays visible; in the Auckland view a whole queue is a few
+;; patches long and its cars overlap there.
+to-report queued-car-size [ cc? ]
+  let m-per-patch ((item 1 map-env) - (item 0 map-env)) / world-width
+  report max (list 1.5 (min (list (car-size cc?) (0.8 * queue-spacing-m / m-per-patch / 0.9))))
+end
+
+;; minutes added to a road with an end outside the cordon when routing a car from its gate to its
+;; building, so that it leaves the cordon only where the roads inside do not connect
+to-report cordon-exit-penalty
+  report 60
+end
+
+;; free-flow minutes of a straight hop of m metres where a route has no road (a home off the road
+;; network, a gate without its segment's inside end): 50 km/h
+to-report hop-minutes [ metres ]
+  report metres / 1000 / 50 * 60
+end
+
+;; map style of TomTom frc k (0 motorway .. 4 local): grey shade, and line width in each view
+to-report road-color [ k ]
+  report item k [ 7 5 4 3 2.5 ]
+end
+
+to-report road-width [ k cc? ]
+  report item k ifelse-value cc? [ [ 3 2.5 2 1.5 1 ] ] [ [ 1.5 1 0.8 0.5 0.5 ] ]
+end
+
+;; a road section on the commuters' routes is drawn a little wider than other roads of its class,
+;; and wider again the slower its traffic (speed grade g), so that its colour shows in both views
+to-report section-width [ k g cc? ]
+  report (max (list (road-width k cc?) ifelse-value cc? [ 2.5 ] [ 1.2 ])) + g * ifelse-value cc? [ 0.6 ] [ 0.5 ]
+end
+
+;; colours (RGB) of slow, heavy and jammed traffic (normal traffic keeps the road's grey): light
+;; yellow, amber orange, bright purple, all clearly visible on black. No red (queued cars), no green
+;; (public transport), and none of the corridor colours of the cars (corridor-color: 105 blue, 45
+;; yellow, 125 magenta, 25 orange, 85 cyan): the yellow is paler, the orange yellower and the purple
+;; lighter than the nearest car colour, so a car stands out on any road
+to-report grade-colors
+  report [ [ 255 235 120 ] [ 255 160 0 ] [ 185 95 255 ] ]
+end
+
+;; speed grades by speed factor f (share of free-flow speed): normal f >= 0.80, slow 0.60 to 0.80,
+;; heavy 0.40 to 0.60, jammed below 0.40 (these are the lower bounds of the first three); a motorway
+;; section in broken-down flow is jammed at any speed (section-grade)
+to-report grade-bands
+  report [ 0.80 0.60 0.40 ]
+end
+
+;; ------------------------------------------------------------------ helpers
+
+to-report path-join [ dir file ]
+  report (word dir "/" file)
+end
+
+to-report pad2 [ d ]
+  report ifelse-value (d < 10) [ (word "0" d) ] [ (word d) ]
+end
+
+to-report col [ header name ]
+  let i position name header
+  if i = false [ error (word "column " name " missing") ]
+  report i
+end
+
+to-report read-rows [ dir file ]
+  let f path-join dir file
+  if not file-exists? f [ error (word "missing file " f) ]
+  report filter [ r -> length r > 1 ] csv:from-file f
+end
+
+;; no greens (PT) and no red (cars waiting in a gate queue) in the corridor palette
+to-report corridor-color [ cid ]
+  let palette [ 105 45 125 25 85 135 95 115 35 5 ]
+  report item ((table:get corr-index cid) mod length palette) palette
+end
+
+;; "West (Fanshawe Street ramp, Westhaven Drive)" -> "Fanshawe Street ramp": the first road the cars of
+;; a corridor enter the cordon by, the queue plot's legend (all the roads in brackets would take most
+;; of the plot's height, and the compass sector alone says little about where the queue is)
+to-report corridor-entry-name [ nm ]
+  let i position " (" nm
+  if i = false [ report nm ]
+  let roads-text substring nm (i + 2) (length nm - 1)
+  let comma position "," roads-text
+  report ifelse-value (comma = false) [ roads-text ] [ substring roads-text 0 comma ]
+end
+
+;; day d is charged: from charge-from-day on (0 = never)
+to-report charged-day? [ d ]
+  report (charge-from-day > 0) and (d >= charge-from-day)
+end
+
+to-report hhmm [ m ]
+  let mm floor m
+  report (word pad2 floor (mm / 60) ":" pad2 (mm mod 60))
+end
+
+to-report xy-key [ x y ]
+  report (word round x " " round y)
+end
+
+to-report dist-m [ a b ]
+  report sqrt (((item 0 b) - (item 0 a)) ^ 2 + ((item 1 b) - (item 1 a)) ^ 2)
+end
+
+;; ------------------------------------------------------------------ setup
+
+to setup
+  setup-run run-folder-of experiment pt-disruption
+end
+
+;; The experiments the experiment chooser lists: who decides (a rule or an LLM), when (only on
+;; triggers, or every agent every day) and the peak charge. Each is a run folder of
+;; python -m cordonlite.run (seed 1, 10 days, charged from day 6: --days 10 --fee-start 6); the $6 runs have the usual charge, the
+;; $18 runs have --peak-fee 18. The two lists are in the same order.
+to-report experiment-labels
+  report [ "Rule, reacts to events: $6 charge"
+           "Rule, reacts to events: $18 charge"
+           "Rule, decides every day: $6 charge"
+           "Rule, decides every day: $18 charge"
+           "LLM, reacts to events: $6 charge"
+           "LLM, reacts to events: $18 charge"
+           "LLM, decides every day: $6 charge"
+           "LLM, decides every day: $18 charge" ]
+end
+
+to-report experiment-folders
+  report [ "../runs/R-clock_mock_py_s1"
+           "../runs/R-clock_mock_py_s1_peak18"
+           "../runs/R-daily_mock_py_s1"
+           "../runs/R-daily_mock_py_s1_peak18"
+           "../runs/L-clock_mock_py_s1"
+           "../runs/L-clock_mock_py_s1_peak18"
+           "../runs/L-daily_mock_py_s1"
+           "../runs/L-daily_mock_py_s1_peak18" ]
+end
+
+;; The PT disruption chooser: none, or a disruption on day 3 and another on day 8, on each of which the
+;; public transport time of one corridor doubles (the run folder of the experiment with the suffix:
+;; cordonlite.run --set events.pt_disruption_day=[3,8]). Day 3 is before the charge starts (day 6) and
+;; day 8 after it, so a disruption and the start of the charge never fall on the same day.
+to-report pt-disruption-labels
+  report [ "none" "day 3 and day 8" ]
+end
+
+to-report pt-disruption-suffixes
+  report [ "" "_pt3_pt8" ]
+end
+
+to-report run-folder-of [ experiment-label disruption-label ]
+  report (word item (position experiment-label experiment-labels) experiment-folders
+               item (position disruption-label pt-disruption-labels) pt-disruption-suffixes)
+end
+
+;; setup on the run folder dir. The scripts call it with any folder (setup-run "<path>"): the
+;; experiment chooser takes only the experiments it lists.
+to setup-run [ dir ]
+  clear-all
+  set charge-on "all days"
+  set scen-dir dir
+  ;; an error, not a message: a script that drives setup headless stops at once
+  if not file-exists? path-join scen-dir "agents.csv" [
+    error (word "There is no run in " scen-dir " (no agents.csv). Make the run first with python -m cordonlite.run.")
+  ]
+  set sim-start-min 330
+  set sim-end-cap-min 720
+  set current-day 0
+  set day-running? false
+  set clock sim-start-min
+  set day-start sim-start-min
+  set day-end-min sim-start-min
+  set fee-active-today? false
+  set n-cars 0
+  set mean-delay 0
+  set max-delay 0
+  set day-exits []
+  set last-plot-min -1
+  set route-cache table:make
+  set today-road []
+  read-corridors
+  read-agents
+  read-fees
+  read-scenario-meta
+  read-clock
+  read-roads
+  read-pt-times
+  read-plans
+  print (word "Cordon-Lite network model: " count commuters " commuters, " length corr-ids " corridors from " scen-dir)
+  load-map
+  build-network
+  read-section-map
+  read-buildings
+  make-gates
+  assign-workplaces
+  make-routes
+  set-map-view "Auckland"
+  reset-ticks
+  print "Ready: press go to drive the next day."
+end
+
+;; The run's scenario.csv (key, value: charge_from_day, n_days; cordonlite/run.py write_scenario).
+;; Without the file (a synthetic folder such as the equivalence check's test scenarios) the
+;; config.toml value: the charge from day 11 ([fees] fee_start_day); the number of days is unknown, so
+;; go plays on.
+to read-scenario-meta
+  set charge-from-day 11
+  set scen-n-days -1
+  let f path-join scen-dir "scenario.csv"
+  if file-exists? f [
+    foreach but-first csv:from-file f [ r ->
+      if (item 0 r) = "charge_from_day" [ set charge-from-day item 1 r ]
+      if (item 0 r) = "n_days" [ set scen-n-days item 1 r ]
+    ]
+  ]
+end
+
+;; From the run's config_snapshot.toml: the engine clock ([time] sim_start_min, sim_end_cap_min; the
+;; values NetLogoEngine passes with set-clock) and [engine] agents_represented. Without the file (a
+;; synthetic folder) the config.toml values: 330, 720 and 19,000. With road files read-roads then sets
+;; vehicles-per-agent to their value.
+to read-clock
+  let represented 19000
+  let f path-join scen-dir "config_snapshot.toml"
+  if file-exists? f [
+    let section ""
+    file-open f
+    while [ not file-at-end? ] [
+      let txt file-read-line
+      if (length txt > 0) and (first txt = "[") [ set section txt ]
+      if member? "=" txt [
+        let k position "=" txt
+        let key-name remove " " substring txt 0 k
+        let value-text substring txt (k + 1) (length txt)
+        if section = "[time]" and key-name = "sim_start_min" [ set sim-start-min read-from-string value-text ]
+        if section = "[time]" and key-name = "sim_end_cap_min" [ set sim-end-cap-min read-from-string value-text ]
+        if section = "[engine]" and key-name = "agents_represented" [ set represented read-from-string value-text ]
+      ]
+    ]
+    file-close
+  ]
+  set vehicles-per-agent represented / max (list 1 count commuters)
+  set clock sim-start-min
+  set day-start sim-start-min
+  set day-end-min sim-start-min
+end
+
+to read-corridors
+  let rows read-rows scen-dir "corridors.csv"
+  let h first rows
+  let ic col h "corridor_id"
+  let ik col h "capacity_per_min"
+  let iname col h "name"
+  let ix col h "x"
+  let iy col h "y"
+  let body sort-by [ [a b] -> (item ic a) < (item ic b) ] but-first rows
+  set corr-ids map [ r -> item ic r ] body
+  set corr-caps map [ r -> item ik r ] body
+  set corr-names map [ r -> (word item iname r) ] body
+  set corr-xy map [ r -> list (item ix r) (item iy r) ] body
+  set corr-index table:make
+  foreach range length corr-ids [ k -> table:put corr-index (item k corr-ids) k ]
+end
+
+to read-agents
+  let rows read-rows scen-dir "agents.csv"
+  let h first rows
+  let ia col h "agent_id"
+  let ic col h "corridor_id"
+  let ig col h "fftt_to_gate_min"
+  let id col h "fftt_gate_to_dest_min"
+  let ix col h "x"
+  let iy col h "y"
+  set agent-fg table:make
+  set agent-gd table:make
+  set agent-corr table:make
+  set commuter-of table:make
+  foreach but-first rows [ r ->
+    let aid item ia r
+    table:put agent-corr aid (item ic r)
+    table:put agent-fg aid (item ig r)
+    table:put agent-gd aid (item id r)
+    create-commuters 1 [
+      set agent-id aid
+      set corridor-id item ic r
+      set home-x item ix r
+      set home-y item iy r
+      set mode-today "NONE"
+      set dep -1
+      set gate-arr -1
+      set gate-exit -1
+      set arr -1
+      set q-rank 0
+      set hidden? true
+      table:put commuter-of aid self
+    ]
+  ]
+end
+
+to read-fees
+  let rows read-rows scen-dir "fees.csv"
+  let h first rows
+  let im col h "minute"
+  let ifee col h "fee"
+  let t table:make
+  foreach but-first rows [ r -> table:put t (item im r) (item ifee r) ]
+  set fee-list n-values 1440 [ m -> ifelse-value (table:has-key? t m) [ table:get t m ] [ 0 ] ]
+end
+
+;; The road files of a run folder (cordonlite/roads.py write_road_scenario), all four or none:
+;;   road_sections.csv  section_id, ff_min, cap_vph, bg_peak_vph, obs_peak_vph, w_factor
+;;                      (+ mwy, bd_on, bd_off with motorway breakdown)
+;;                      (+ profile_id, and cap_drop with motorway breakdown: NZTA motorway counts)
+;;   agent_routes.csv   agent_id, seq, section_id (the route from home to the gate, seq 0 at home)
+;;   road_profile.csv   minute, r (1440 rows: profile 0) or profile_id, minute, r (1440 rows per profile)
+;;   road_params.csv    key, value: bpr_alpha, bpr_beta (4), speed_floor, flow_window_min,
+;;                      vehicles_per_agent (+ mwy_breakdown, mwy_breakdown_vc, mwy_recover_vc,
+;;                      mwy_capacity_drop, mwy_jam_speed with motorway breakdown)
+;; Without them road-on? is false and every car drives at free flow. With them vehicles-per-agent is
+;; the file's value (not agents_represented / commuters), as in PyEngine. Without the mwy_breakdown
+;; key (or 0) mwy-on? is false and every section follows the plain BPR curve. Without the profile_id
+;; column every section uses profile 0; without cap_drop every section's divisor is mwy-keep (the same
+;; double as 1 - cap_drop with cap_drop = mwy_capacity_drop). Python checks the files
+;; (cordonlite.roads.read_road_scenario) before NetLogoEngine loads them.
+to read-roads
+  set road-on? false
+  set sec-ids []
+  set sec-index table:make
+  set sec-ff []
+  set sec-cap []
+  set sec-bg []
+  set sec-obs []
+  set sec-w []
+  set sec-fpe []
+  set agent-route table:make
+  set road-r []
+  set road-profiles table:make
+  set sec-r []
+  set sec-keep []
+  set mwy-on? false
+  set sec-mwy []
+  set sec-bd-on []
+  set sec-bd-off []
+  set mwy-vc 1
+  set mwy-keep 1
+  set mwy-jam 1
+  let files [ "road_sections.csv" "agent_routes.csv" "road_profile.csv" "road_params.csv" ]
+  let present filter [ fname -> file-exists? path-join scen-dir fname ] files
+  if empty? present [ stop ]
+  if length present < length files [ error (word "incomplete road files in " scen-dir ": only " present) ]
+  ;; parameters
+  let p table:make
+  foreach but-first read-rows scen-dir "road_params.csv" [ r -> table:put p (word item 0 r) (item 1 r) ]
+  foreach [ "bpr_alpha" "bpr_beta" "speed_floor" "flow_window_min" "vehicles_per_agent" ] [ key ->
+    if not table:has-key? p key [ error (word "road_params.csv lacks " key) ]
+  ]
+  if (table:get p "bpr_beta") != 4 [ error "road_params.csv: bpr_beta must be 4 (the engines compute (x * x) * (x * x))" ]
+  set road-alpha table:get p "bpr_alpha"
+  set road-floor table:get p "speed_floor"
+  set road-window table:get p "flow_window_min"
+  set road-vpa table:get p "vehicles_per_agent"
+  if table:has-key? p "mwy_breakdown" [ set mwy-on? (table:get p "mwy_breakdown") = 1 ]
+  if mwy-on? [
+    foreach [ "mwy_breakdown_vc" "mwy_capacity_drop" "mwy_jam_speed" ] [ key ->
+      if not table:has-key? p key [ error (word "road_params.csv lacks " key) ]
+    ]
+    set mwy-vc table:get p "mwy_breakdown_vc"
+    set mwy-keep 1 - (table:get p "mwy_capacity_drop")   ;; the same double as RoadScenario.mwy_keep
+    set mwy-jam table:get p "mwy_jam_speed"
+  ]
+  ;; sections, ascending section_id
+  let rows read-rows scen-dir "road_sections.csv"
+  let h first rows
+  let isec col h "section_id"
+  let iff col h "ff_min"
+  let icap col h "cap_vph"
+  let ibg col h "bg_peak_vph"
+  let iobs col h "obs_peak_vph"
+  let iw col h "w_factor"
+  let body sort-by [ [a b] -> (item isec a) < (item isec b) ] but-first rows
+  set sec-ids map [ r -> item isec r ] body
+  set sec-ff map [ r -> item iff r ] body
+  set sec-cap map [ r -> item icap r ] body
+  set sec-bg map [ r -> item ibg r ] body
+  set sec-obs map [ r -> item iobs r ] body
+  set sec-w map [ r -> item iw r ] body
+  ifelse member? "mwy" h [
+    let imw col h "mwy"
+    let ion col h "bd_on"
+    let ioff col h "bd_off"
+    set sec-mwy map [ r -> item imw r ] body
+    set sec-bd-on map [ r -> item ion r ] body
+    set sec-bd-off map [ r -> item ioff r ] body
+  ] [
+    if mwy-on? [ error "road_sections.csv lacks the columns mwy, bd_on, bd_off (motorway breakdown is on)" ]
+    set sec-mwy map [ r -> 0 ] body
+    set sec-bd-on map [ r -> -1 ] body
+    set sec-bd-off map [ r -> -1 ] body
+  ]
+  foreach range length sec-ids [ k -> table:put sec-index (item k sec-ids) k ]
+  ;; the same expression as RoadScenario.fpe: ((vehicles_per_agent * w_factor) * 60) / window
+  set sec-fpe map [ w -> ((road-vpa * w) * 60) / road-window ] sec-w
+  ;; capacity drop of each section: 1 - cap_drop, computed once (RoadScenario.sec_keep)
+  ifelse member? "cap_drop" h [
+    let icd col h "cap_drop"
+    set sec-keep map [ r -> 1 - (item icd r) ] body
+  ] [
+    set sec-keep map [ r -> mwy-keep ] body
+  ]
+  let sec-pid map [ r -> 0 ] body   ;; profile_id of each section (0 without the column)
+  if member? "profile_id" h [
+    let ipid col h "profile_id"
+    set sec-pid map [ r -> item ipid r ] body
+  ]
+  ;; time profiles: one (minute, r: profile 0) or several (profile_id, minute, r)
+  set rows read-rows scen-dir "road_profile.csv"
+  set h first rows
+  let im col h "minute"
+  let ir col h "r"
+  let ip ifelse-value (member? "profile_id" h) [ col h "profile_id" ] [ -1 ]
+  let t table:make   ;; profile_id -> table minute -> r
+  foreach but-first rows [ r ->
+    let k ifelse-value (ip >= 0) [ item ip r ] [ 0 ]
+    if not table:has-key? t k [ table:put t k table:make ]
+    table:put (table:get t k) (item im r) (item ir r)
+  ]
+  foreach sort table:keys t [ k ->
+    let tk table:get t k
+    foreach range 1440 [ m -> if not table:has-key? tk m [ error (word "road_profile.csv: profile " k " lacks minute " m) ] ]
+    table:put road-profiles k n-values 1440 [ m -> table:get tk m ]
+  ]
+  foreach remove-duplicates sec-pid [ k ->
+    if not table:has-key? road-profiles k [ error (word "road_sections.csv: profile_id " k " is not in road_profile.csv") ]
+  ]
+  set sec-r map [ k -> table:get road-profiles k ] sec-pid
+  set road-r ifelse-value (table:has-key? road-profiles 0) [ table:get road-profiles 0 ] [ table:get road-profiles (min table:keys road-profiles) ]
+  ;; routes: section positions in seq order
+  set rows read-rows scen-dir "agent_routes.csv"
+  set h first rows
+  let ia col h "agent_id"
+  let iq col h "seq"
+  set isec col h "section_id"
+  let legs table:make   ;; agent_id -> [seq section_id] rows
+  foreach but-first rows [ r ->
+    table:put legs (item ia r) (lput (list (item iq r) (item isec r)) (table:get-or-default legs (item ia r) []))
+  ]
+  foreach sort table:keys legs [ aid ->
+    let ordered sort-by [ [a b] -> (item 0 a) < (item 0 b) ] table:get legs aid
+    table:put agent-route aid map [ q -> table:get sec-index (item 1 q) ] ordered
+  ]
+  set road-on? true
+  set vehicles-per-agent road-vpa
+end
+
+;; PT departure and arrival minutes of every PT trip of the run (outcomes.csv); empty without it
+to read-pt-times
+  set pt-times table:make
+  let f path-join scen-dir "outcomes.csv"
+  if not file-exists? f [ stop ]
+  let rows read-rows scen-dir "outcomes.csv"
+  let h first rows
+  let ia col h "agent_id"
+  let id col h "day"
+  let im col h "mode"
+  let idep col h "depart_min"
+  let iarr col h "arrive_min"
+  foreach but-first rows [ r ->
+    if (item im r) = "PT" and is-number? item idep r and is-number? item iarr r [
+      table:put pt-times (word item id r " " item ia r) (list (item idep r) (item iarr r))
+    ]
+  ]
+end
+
+;; The plans of every day of the run, read once from plans.csv (day, agent_id, mode, depart_min;
+;; cordonlite/run.py write_outputs) into day-plans: day -> that day's rows, header row first, as
+;; start-day reads them. Empty without the file (a synthetic folder): start-day plays demo plans.
+to read-plans
+  set day-plans table:make
+  let f path-join scen-dir "plans.csv"
+  if not file-exists? f [ stop ]
+  let rows read-rows scen-dir "plans.csv"
+  let header first rows
+  let iday col header "day"
+  let rows-of-day table:make
+  foreach but-first rows [ r ->
+    table:put rows-of-day (item iday r) (fput r table:get-or-default rows-of-day (item iday r) [])
+  ]
+  foreach table:keys rows-of-day [ d ->
+    table:put day-plans d (fput header reverse table:get rows-of-day d)
+  ]
+end
+
+;; ------------------------------------------------------------------ map and network
+
+to load-map
+  foreach (list roads-file (path-join map-dir "cordon.shp") (path-join map-dir "cbd_buildings.shp")
+                (path-join map-dir "cbd_buildings.csv")) [ f ->
+    if not file-exists? f [ error (word "missing " f ": run python -m prep.build_netlogo_layers") ]
+  ]
+  ;; every layer is NZTM2000 (EPSG:2193) and is used in its own coordinates, so no coordinate
+  ;; system is loaded (gis:load-coordinate-system on each setup only printed a re-projection warning)
+  set roads-ds gis:load-dataset roads-file
+  set cordon-ds gis:load-dataset path-join map-dir "cordon.shp"
+  set buildings-ds gis:load-dataset path-join map-dir "cbd_buildings.shp"
+  ;; the network is built (and nodes placed) in the Auckland view
+  apply-envelope view-envelope "Auckland"
+  set map-view "Auckland"
+end
+
+;; Nodes and roads from the TomTom shapefile, as the prep graph (prep/build_inputs.py, build_graph):
+;; a node per segment end, NZTM rounded to 1 m; segments whose ends coincide are dropped; of
+;; parallel segments between the same two nodes the fastest is kept (28,520 nodes, 30,846 roads);
+;; then only the giant component is kept: 28,507 nodes and 30,835 roads, the graph prep routes on.
+;; The roads are the map: every segment is drawn as the road between its two ends (seg-road), a
+;; straight line, in the style of the highest frc of the segments between them.
+to build-network
+  reset-timer
+  set node-at table:make
+  set seg-ends table:make
+  set seg-road table:make
+  let seg-pair table:make          ;; segment_id -> "who who" of its ends
+  let pair-frc table:make          ;; "who who" -> lowest frc of the segments between them
+  let gate-segs table:make
+  let grows read-rows prep-dir "gates.csv"
+  let iseg col first grows "segment_id"
+  foreach but-first grows [ gate-row -> table:put gate-segs (word item iseg gate-row) true ]
+  let fastest-between table:make   ;; "who who" -> [first-node second-node minutes]
+  foreach gis:feature-list-of roads-ds [ road-feature ->
+    let vertices first gis:vertex-lists-of road-feature
+    let first-node node-for nztm-of gis:location-of first vertices
+    let second-node node-for nztm-of gis:location-of last vertices
+    let segment-id (word gis:property-value road-feature "segment_id")
+    if table:has-key? gate-segs segment-id [ table:put seg-ends segment-id (list first-node second-node) ]
+    if first-node != second-node [
+      let minutes (gis:property-value road-feature "distance") / 1000 / (gis:property-value road-feature "speedLimit") * 60
+      let pair-key ifelse-value ([who] of first-node < [who] of second-node) [ (word [who] of first-node " " [who] of second-node) ] [ (word [who] of second-node " " [who] of first-node) ]
+      if (not table:has-key? fastest-between pair-key) or (minutes < item 2 table:get fastest-between pair-key) [ table:put fastest-between pair-key (list first-node second-node minutes) ]
+      table:put seg-pair segment-id pair-key
+      table:put pair-frc pair-key min (list (gis:property-value road-feature "frc") (table:get-or-default pair-frc pair-key 4))
+    ]
+  ]
+  let road-of table:make           ;; "who who" -> road
+  foreach table:keys fastest-between [ pair-key ->
+    let node-pair-and-minutes table:get fastest-between pair-key
+    ask item 0 node-pair-and-minutes [ create-road-with item 1 node-pair-and-minutes [
+      set free-flow-minutes item 2 node-pair-and-minutes
+      set road-frc table:get pair-frc pair-key
+      set road-secs []
+      set hidden? true
+      table:put road-of pair-key self
+    ] ]
+  ]
+  foreach table:keys seg-pair [ segment-id -> table:put seg-road segment-id table:get road-of table:get seg-pair segment-id ]
+  nw:set-context nodes roads
+  ;; the two small fragments (13 nodes, none in the cordon) cannot be reached from anywhere else
+  let components sort-by [ [larger smaller] -> count larger > count smaller ] nw:weak-component-clusters
+  foreach but-first components [ fragment -> ask fragment [ table:remove node-at xy-key node-x node-y  die ] ]
+  ;; inside the cordon (on its boundary counts as inside, as prep's inside_mask)
+  let cordon-envelope gis:envelope-of cordon-ds
+  ask nodes [ set in-cordon? false ]
+  ask nodes with [ node-x >= item 0 cordon-envelope and node-x <= item 1 cordon-envelope and node-y >= item 2 cordon-envelope and node-y <= item 3 cordon-envelope ]
+    [ set in-cordon? gis:intersects? cordon-ds self ]
+  ask roads [ set cordon-routing-minutes free-flow-minutes + ifelse-value ([in-cordon?] of end1 and [in-cordon?] of end2) [ 0 ] [ cordon-exit-penalty ] ]
+  ;; the cordon's own roads fall into 15 pieces (the SA3 line cuts some streets); buildings are
+  ;; reached from the largest, which holds 1,066 of the 1,106 cordon nodes
+  nw:with-context (nodes with [ in-cordon? ]) (roads with [ [in-cordon?] of end1 and [in-cordon?] of end2 ]) [
+    set main-inner first sort-by [ [larger smaller] -> count larger > count smaller ] nw:weak-component-clusters
+  ]
+  print (word "Road network: " count nodes " nodes, " count roads " roads, "
+              count nodes with [ in-cordon? ] " nodes in the cordon (" precision timer 1 " s)")
+end
+
+;; The road links of every section of this run (road_sections.csv), from the prep file
+;; ../data/section_segments.csv (section_id, seq, segment_id: the TomTom segments of each section,
+;; through seg-road), and each section's frc. Sections are then graded at the clock (before the first day: background
+;; traffic only). Without road files, or without that file, roads keep their grey.
+to read-section-map
+  set sec-links []
+  set sec-frc []
+  set sec-order []
+  set speed-grade []
+  set grade-shown []
+  set grade-pending []
+  set grade-minute -1
+  set grade-entries []
+  set grade-first-min 0
+  set sec-km []
+  set sec-los-mwy []
+  set los-grade []
+  set los-ef-mwy -1
+  set los-ef-other -1
+  set los-vc-mwy -1
+  set los-vc-other -1
+  set los-speed-grade []
+  set los-efs-mwy -1
+  set los-efs-other -1
+  set sec-region []
+  set los-region-ef []
+  set los-region-vc []
+  set los-mark -1
+  if not road-on? [ stop ]
+  if not file-exists? path-join prep-dir "section_segments.csv" [
+    print (word "No " path-join prep-dir "section_segments.csv" ": roads are not coloured by traffic")
+    stop
+  ]
+  let rows read-rows prep-dir "section_segments.csv"
+  let isec col first rows "section_id"
+  let iseg col first rows "segment_id"
+  let found table:make         ;; section position -> its road links
+  foreach but-first rows [ r ->
+    let sid (word item iseg r)
+    if (table:has-key? sec-index item isec r) and (table:has-key? seg-road sid) [
+      let i table:get sec-index item isec r
+      let l table:get seg-road sid
+      if (l != nobody) and (not member? l table:get-or-default found i []) [ table:put found i (lput l (table:get-or-default found i [])) ]
+    ]
+  ]
+  set sec-links map [ i -> table:get-or-default found i [] ] range length sec-ids
+  set sec-frc map [ ls -> ifelse-value (empty? ls) [ 4 ] [ min map [ l -> [road-frc] of l ] ls ] ] sec-links
+  foreach range length sec-ids [ i -> foreach item i sec-links [ l -> ask l [ set road-secs lput i road-secs ] ] ]
+  set sec-order sort-by [ [a b] -> ((item a sec-frc) > (item b sec-frc)) or (((item a sec-frc) = (item b sec-frc)) and (a < b)) ]
+                        range length sec-ids
+  let n-missing length filter empty? sec-links
+  if n-missing > 0 [ print (word n-missing " road sections have no segment in section_segments.csv and are not coloured") ]
+  set grade-shown n-values length sec-ids [ 0 ]
+  read-los-sections
+  regrade-roads
+end
+
+;; Level of Service weight and bands of every section, as cordonlite/roads.py los_section_info: km and
+;; mwy of ../data/road_sections.csv (a section missing there: 0 and 0); without the km column the
+;; free-flow minutes weigh, without mwy the run's sec-mwy
+to read-los-sections
+  set sec-km sec-ff
+  set sec-los-mwy sec-mwy
+  set sec-region n-values length sec-ids [ last-region-index ]
+  if not file-exists? path-join prep-dir "road_sections.csv" [ stop ]
+  let rows read-rows prep-dir "road_sections.csv"
+  let h first rows
+  let isec col h "section_id"
+  let by-id table:make
+  foreach but-first rows [ r -> if table:has-key? sec-index (item isec r) [ table:put by-id (item isec r) r ] ]
+  if member? "km" h [
+    let ikm col h "km"
+    set sec-km map [ s -> ifelse-value (table:has-key? by-id s) [ item ikm table:get by-id s ] [ 0 ] ] sec-ids
+  ]
+  if member? "mwy" h [
+    let imw col h "mwy"
+    set sec-los-mwy map [ s -> ifelse-value (table:has-key? by-id s) [ item imw table:get by-id s ] [ 0 ] ] sec-ids
+  ]
+  if (member? "street_name" h) and (member? "x_mid" h) and (member? "y_mid" h) [
+    let iname col h "street_name"
+    let imid-x col h "x_mid"
+    let imid-y col h "y_mid"
+    set sec-region map [ s -> ifelse-value (table:has-key? by-id s)
+      [ region-of (item iname table:get by-id s) (item imid-x table:get by-id s) (item imid-y table:get by-id s) ]
+      [ last-region-index ] ] sec-ids
+  ]
+end
+
+;; The regions of the LoS plots, in the order of cordonlite/roads.py LOS_REGIONS (one pen each)
+to-report los-region-names
+  report [ "SH1" "SH16" "SH20" "North Shore" "New Lynn" "Green Lane" "Other roads" ]
+end
+
+to-report last-region-index
+  report length los-region-names - 1
+end
+
+;; Region (index in los-region-names) of a section from its street name and mid point (NZTM metres), the
+;; first rule that fits, as cordonlite/roads.py los_region_of: the motorways SH1 (Northern and Southern
+;; Motorway), SH16 (Northwestern) and SH20 (Southwestern, or "20") by name; North Shore north of the
+;; Harbour Bridge (mid-y above 5,922,500 and mid-x above 1,753,000); New Lynn within 2,500 m of
+;; (1,750,199; 5,913,928); Green Lane within 1,500 m of (1,759,012; 5,915,788); else Other roads
+to-report region-of [ street-name mid-x mid-y ]
+  let road-name (word street-name)
+  if member? road-name [ "Northern Motorway" "Southern Motorway" ] [ report 0 ]
+  if road-name = "Northwestern Motorway" [ report 1 ]
+  if member? road-name [ "Southwestern Motorway" "20" ] [ report 2 ]
+  if (mid-y > 5922500) and (mid-x > 1753000) [ report 3 ]
+  if ((mid-x - 1750199) * (mid-x - 1750199)) + ((mid-y - 5913928) * (mid-y - 5913928)) <= 2500 * 2500 [ report 4 ]
+  if ((mid-x - 1759012) * (mid-x - 1759012)) + ((mid-y - 5915788) * (mid-y - 5915788)) <= 1500 * 1500 [ report 5 ]
+  report last-region-index
+end
+
+;; NetLogo [x y] -> NZTM [X Y]: inverse of the linear map of the current world envelope
+to-report nztm-of [ p ]
+  report (list ((item 0 map-env) + ((item 0 p) - (min-pxcor - 0.5)) * ((item 1 map-env) - (item 0 map-env)) / world-width)
+               ((item 2 map-env) + ((item 1 p) - (min-pycor - 0.5)) * ((item 3 map-env) - (item 2 map-env)) / world-height))
+end
+
+to-report node-for [ xy ]
+  let key xy-key (item 0 xy) (item 1 xy)
+  if table:has-key? node-at key [ report table:get node-at key ]
+  let n nobody
+  create-nodes 1 [
+    set node-x round item 0 xy
+    set node-y round item 1 xy
+    set hidden? true
+    let p map-xy node-x node-y
+    setxy (item 0 p) (item 1 p)
+    set n self
+  ]
+  table:put node-at key n
+  report n
+end
+
+to-report nearest-node [ x y candidates ]
+  report min-one-of candidates [ (node-x - x) ^ 2 + (node-y - y) ^ 2 ]
+end
+
+;; workplaces: one point inside each footprint, gis/cbd_buildings.csv
+to read-buildings
+  let rows read-rows map-dir "cbd_buildings.csv"
+  let h first rows
+  let ii col h "building_id"
+  let ix col h "x_nztm"
+  let iy col h "y_nztm"
+  foreach but-first rows [ r ->
+    create-buildings 1 [
+      set building-id item ii r
+      set building-x item ix r
+      set building-y item iy r
+      set bnode nobody
+      set shape "square"
+      set hidden? true
+    ]
+  ]
+end
+
+;; One gate turtle per prep gate an agent uses (data/origins.csv gate_id of its origin, found through
+;; personas.csv origin_id or the origin coordinates). A folder whose agents are not prep origins (a
+;; synthetic folder such as the equivalence check's test scenarios) queues each corridor at its
+;; corridor point instead.
+to make-gates
+  let origin-gate table:make     ;; origin_id -> gate_id
+  let xy-gate table:make         ;; "X Y" -> gate_id
+  let orows read-rows prep-dir "origins.csv"
+  let oh first orows
+  foreach but-first orows [ r ->
+    table:put origin-gate (item (col oh "origin_id") r) (item (col oh "gate_id") r)
+    table:put xy-gate (xy-key (item (col oh "x_nztm") r) (item (col oh "y_nztm") r)) (item (col oh "gate_id") r)
+  ]
+  let persona-origin table:make  ;; agent_id -> origin_id
+  if file-exists? path-join scen-dir "personas.csv" [
+    let prows read-rows scen-dir "personas.csv"
+    let ph first prows
+    if member? "origin_id" ph [
+      foreach but-first prows [ r -> table:put persona-origin (item (col ph "agent_id") r) (item (col ph "origin_id") r) ]
+    ]
+  ]
+  let grows read-rows prep-dir "gates.csv"
+  let gh first grows
+  let gate-row table:make
+  foreach but-first grows [ r -> table:put gate-row (item (col gh "gate_id") r) r ]
+  let gate-key table:make        ;; agent_id -> [gate_id corridor_id], gate_id -1 = corridor point
+  ask commuters [
+    set home-node ifelse-value table:has-key? node-at xy-key home-x home-y
+      [ table:get node-at xy-key home-x home-y ] [ nearest-node home-x home-y nodes ]
+    let gid -1
+    if table:has-key? persona-origin agent-id [
+      let oid table:get persona-origin agent-id
+      if table:has-key? origin-gate oid [ set gid table:get origin-gate oid ]
+    ]
+    if gid = -1 and table:has-key? xy-gate xy-key home-x home-y [ set gid table:get xy-gate xy-key home-x home-y ]
+    table:put gate-key agent-id (list gid corridor-id)
+  ]
+  let gate-of table:make         ;; "gate_id corridor_id" -> gate turtle
+  foreach sort-on [ agent-id ] commuters [ c ->
+    let gk table:get gate-key [ agent-id ] of c
+    let key (word item 0 gk " " item 1 gk)
+    if not table:has-key? gate-of key [ table:put gate-of key new-gate (item 0 gk) (item 1 gk) gate-row gh ]
+    ask c [ set my-gate table:get gate-of key ]
+  ]
+end
+
+;; a gate turtle: prep gate gid (its crossing point and the two ends of its segment), or the
+;; corridor point of cid when gid = -1
+to-report new-gate [ gid cid gate-row gh ]
+  let g nobody
+  create-gates 1 [
+    set g self
+    set gate-id gid
+    set corridor-id cid
+    set shape "target"
+    set color corridor-color cid
+    ifelse (gid >= 0) and table:has-key? gate-row gid [
+      let r table:get gate-row gid
+      set gate-x item (col gh "x_nztm") r
+      set gate-y item (col gh "y_nztm") r
+      let ends table:get-or-default seg-ends (word item (col gh "segment_id") r) []
+      ifelse length ends = 2 [
+        ;; prep gate: the path enters the cordon from the outside end u to the inside end v
+        let outside filter [ n -> not [in-cordon?] of n ] ends
+        set outside-node ifelse-value (length outside = 1) [ first outside ] [ item 0 ends ]
+        set inside-node ifelse-value (outside-node = item 0 ends) [ item 1 ends ] [ item 0 ends ]
+      ] [
+        set outside-node nearest-node gate-x gate-y nodes with [ not in-cordon? ]
+        set inside-node nobody
+      ]
+    ] [
+      let p item (table:get corr-index cid) corr-xy
+      set gate-x item 0 p
+      set gate-y item 1 p
+      set outside-node nearest-node gate-x gate-y nodes
+      set inside-node nobody
+    ]
+  ]
+  report g
+end
+
+to assign-workplaces
+  if not any? buildings [ error "no buildings in gis/cbd_buildings.csv" ]
+  with-local-randomness [
+    random-seed workplace-seed
+    foreach sort-on [ agent-id ] commuters [ c -> ask c [ set work-building one-of buildings ] ]
+  ]
+  let inside ifelse-value any? main-inner [ main-inner ] [ nodes ]
+  ask (turtle-set [ work-building ] of commuters) [ set bnode nearest-node building-x building-y inside ]
+end
+
+;; shortest path from-node -> to-node on link weight weight-name ("free-flow-minutes" or
+;; "cordon-routing-minutes") as a list of nodes (cached); a straight
+;; hop when unreachable, which cannot happen on the giant component but is reported if it does
+to-report route-nodes [ from-node to-node weight-name ]
+  if from-node = to-node [ report (list from-node) ]
+  let cache-key (word [who] of from-node " " [who] of to-node " " weight-name)
+  if table:has-key? route-cache cache-key [ report table:get route-cache cache-key ]
+  let path false
+  ;; the nw primitives take the weight as a literal name, not as a variable holding it
+  ifelse weight-name = "cordon-routing-minutes"
+    [ ask from-node [ set path nw:turtles-on-weighted-path-to to-node "cordon-routing-minutes" ] ]
+    [ ask from-node [ set path nw:turtles-on-weighted-path-to to-node "free-flow-minutes" ] ]
+  if not is-list? path [
+    print (word "No road path between " from-node " and " to-node ": drawn as a straight line")
+    set path (list from-node to-node)
+  ]
+  table:put route-cache cache-key path
+  report path
+end
+
+to-report node-points [ ns ]
+  report map [ n -> list ([node-x] of n) ([node-y] of n) ] ns
+end
+
+to-report cum-lengths [ pts ]
+  let out [ 0 ]
+  foreach range (length pts - 1) [ i -> set out lput ((last out) + dist-m (item i pts) (item (i + 1) pts)) out ]
+  report out
+end
+
+;; home -> outside end of the gate segment -> gate point; gate point -> inside end -> building.
+;; The leg from the gate is routed on cordon-routing-minutes, so a car that has passed its gate stays inside the
+;; cordon wherever the cordon's roads connect (on plain free-flow-minutes about two thirds of these legs would
+;; leave and re-enter it). On roads it leaves only from gates whose inside end connects to the rest
+;; of the cordon through a road just outside it (the Wellesley Street ramp, about 100 to 160 m, and
+;; Hopetoun Street); the setup message counts those legs. The car parks at the cordon node nearest
+;; its building, and the commuter is drawn at the building on arrival.
+;; A home that is not a road node (a synthetic folder such as the equivalence check's test scenarios)
+;; starts with a straight hop to its nearest node; the setup message counts homes more than 500 m
+;; from one.
+to make-routes
+  reset-timer
+  let n-leave 0
+  let n-far 0
+  ask commuters [
+    let commuter-gate my-gate
+    let gate-point list ([gate-x] of commuter-gate) ([gate-y] of commuter-gate)
+    let route-to-gate route-nodes home-node [outside-node] of commuter-gate "free-flow-minutes"
+    let route-points node-points route-to-gate
+    ;; free-flow minutes along the route (the road links' free-flow-minutes, as prep's path weights)
+    let cumulative-minutes [ 0 ]
+    foreach range (length route-to-gate - 1) [ step ->
+      let step-link [ road-with item (step + 1) route-to-gate ] of item step route-to-gate
+      set cumulative-minutes lput ((last cumulative-minutes) + ifelse-value (step-link != nobody) [ [free-flow-minutes] of step-link ] [ hop-minutes dist-m (item step route-points) (item (step + 1) route-points) ]) cumulative-minutes
+    ]
+    if dist-m (list home-x home-y) (first route-points) > 500 [ set n-far n-far + 1 ]
+    if dist-m (list home-x home-y) (first route-points) > 0.5 [
+      let hop hop-minutes dist-m (list home-x home-y) (first route-points)
+      set cumulative-minutes fput 0 map [ minutes -> minutes + hop ] cumulative-minutes
+      set route-points fput (list home-x home-y) route-points
+    ]
+    ;; the gate point closes the route with the minutes of the whole gate segment (to its inside end,
+    ;; where the engine's route to the gate ends)
+    let gate-link ifelse-value ([inside-node] of commuter-gate != nobody) [ [ road-with [inside-node] of commuter-gate ] of [outside-node] of commuter-gate ] [ nobody ]
+    set route-out-minutes lput ((last cumulative-minutes) + ifelse-value (gate-link != nobody) [ [free-flow-minutes] of gate-link ] [ hop-minutes dist-m (last route-points) gate-point ]) cumulative-minutes
+    set route-out lput gate-point route-points
+    let workplace work-building
+    let leg route-nodes (leg-start commuter-gate) [bnode] of workplace "cordon-routing-minutes"
+    if any? (turtle-set leg) with [ not in-cordon? ] [ set n-leave n-leave + 1 ]
+    ;; the car parks at the road node nearest the building (median 65 m away); the commuter is
+    ;; drawn at the building on arrival, so no car drives off the roads (across the wharves)
+    set route-in fput gate-point (node-points leg)
+    set len-out cum-lengths route-out
+    set len-in cum-lengths route-in
+  ]
+  print (word "Routes: " count commuters " commuters; " n-leave " legs from a gate to a building use "
+              "roads outside the cordon (" precision timer 1 " s)")
+  if n-far > 0 [
+    print (word n-far " homes are more than 500 m from a road node and start with a straight line "
+                "(their folder's homes are not prep origins)")
+  ]
+end
+
+;; first node after the gate point: the inside end of a prep gate segment, else the gate node
+to-report leg-start [ commuter-gate ]
+  report ifelse-value ([inside-node] of commuter-gate != nobody) [ [inside-node] of commuter-gate ] [ [outside-node] of commuter-gate ]
+end
+
+;; ------------------------------------------------------------------ views
+
+to set-map-view [ v ]
+  if not is-list? map-env [ user-message "Press setup first." stop ]
+  if not member? v [ "Auckland" "City centre" ] [ error (word "unknown map view " v) ]
+  set map-view v
+  apply-envelope view-envelope v
+  draw-map
+  place-gates
+  update-commuters
+  display   ;; the view updates on ticks; a view change between ticks must show at once
+end
+
+to apply-envelope [ env ]
+  gis:set-world-envelope env
+  set map-env gis:world-envelope
+end
+
+;; [minx maxx miny maxy] NZTM of view v: the layer's envelope plus a margin (gis:set-world-envelope
+;; widens it to the world's aspect ratio)
+to-report view-envelope [ v ]
+  let cc? v = "City centre"
+  let env ifelse-value cc? [ gis:envelope-of cordon-ds ] [ gis:envelope-of roads-ds ]
+  let margin ifelse-value cc? [ 0.15 ] [ 0.01 ]
+  let w ((item 1 env) - (item 0 env)) * margin
+  let h ((item 3 env) - (item 2 env)) * margin
+  report (list ((item 0 env) - w) ((item 1 env) + w) ((item 2 env) - h) ((item 3 env) + h))
+end
+
+;; NZTM metres -> [xcor ycor] (gis:location-of's mapping); [] outside the world
+to-report map-xy [ x y ]
+  let px (min-pxcor - 0.5) + (x - item 0 map-env) * world-width / ((item 1 map-env) - (item 0 map-env))
+  let py (min-pycor - 0.5) + (y - item 2 map-env) * world-height / ((item 3 map-env) - (item 2 map-env))
+  if (px < min-pxcor - 0.5) or (px >= max-pxcor + 0.5) or (py < min-pycor - 0.5) or (py >= max-pycor + 0.5)
+    [ report [] ]
+  report list px py
+end
+
+;; turtle procedure: show at NZTM (x, y), hidden when outside the view
+to place-at [ x y ]
+  let p map-xy x y
+  ifelse empty? p [ set hidden? true ] [ setxy (item 0 p) (item 1 p)  set hidden? false ]
+end
+
+to draw-map
+  clear-drawing
+  let cc? map-view = "City centre"
+  if cc? [
+    gis:set-drawing-color gray - 3.5
+    gis:fill buildings-ds 0
+  ]
+  draw-cordon
+  place-network
+  ask roads [ style-road cc? ]
+  if not empty? sec-links [ set grade-shown speed-grade ]
+  set grade-pending []
+end
+
+to draw-cordon
+  gis:set-drawing-color white
+  gis:draw cordon-ds ifelse-value (map-view = "City centre") [ 2 ] [ 1.5 ]
+end
+
+;; The nodes at their place in the current view (they stay hidden) and the roads shown where both
+;; ends are in it: in the City centre view a road leaving the view is not drawn
+to place-network
+  ask nodes [
+    let p map-xy node-x node-y
+    set in-view? not empty? p
+    if in-view? [ setxy (item 0 p) (item 1 p) ]
+  ]
+  ask roads [ set hidden? not ([in-view?] of end1 and [in-view?] of end2) ]
+end
+
+;; road procedure: the grey and width of its frc, or, on the commuters' routes, the colour of the
+;; slowest grade of its sections (the two directions of a street are two sections on one road):
+;; normal in the road's grey, slow, heavy and jammed in grade-colors, each a little wider than the
+;; one before. Widths are in pixels, link thickness in patches.
+to style-road [ cc? ]
+  let g ifelse-value (empty? road-secs) [ -1 ] [ max map [ i -> item i speed-grade ] road-secs ]
+  set color ifelse-value (g <= 0) [ road-color road-frc ] [ item (g - 1) grade-colors ]
+  set thickness (ifelse-value (g < 0) [ road-width road-frc cc? ] [ section-width road-frc g cc? ]) / patch-size
+end
+
+;; recolour the roads of the sections at positions ids to their speed grade
+to draw-sections [ ids ]
+  let cc? map-view = "City centre"
+  foreach ids [ i ->
+    ask link-set item i sec-links [ style-road cc? ]
+    set grade-shown replace-item i grade-shown (item i speed-grade)
+  ]
+end
+
+;; Every 5 simulated minutes: grade the sections again (regrade-roads) and recolour the roads of
+;; those whose colour changed (a link's colour is cheap to set, so all at once)
+to update-road-colours
+  if empty? sec-links [ stop ]
+  if 5 * floor (clock / 5) != grade-minute [ regrade-roads ]
+  draw-pending length grade-pending
+end
+
+;; recolour the first n queued sections
+to draw-pending [ n ]
+  if empty? grade-pending [ stop ]
+  let k min (list n length grade-pending)
+  draw-sections sublist grade-pending 0 k
+  set grade-pending sublist grade-pending k length grade-pending
+end
+
+;; grade every section at the last 5-minute mark of the clock (speed-grades-at) and queue, in
+;; sec-order, the sections whose colour on the map differs from their grade's
+to regrade-roads
+  let m 5 * floor (clock / 5)
+  let cs window-counts m
+  set speed-grade (map [ [i c] -> section-grade i m c ] (range length sec-ids) cs)
+  set grade-minute m
+  set grade-pending filter [ i -> (item i speed-grade) != (item i grade-shown) ] sec-order
+  update-los m cs
+end
+
+;; speed grade of every section at minute m, from its speed factor: the engine's road-speed-factor
+;; (background traffic of minute m plus today's commuter entries at minutes m - road-window .. m - 1,
+;; over the section's capacity; speed / free-flow speed, at least road-floor). A motorway section in
+;; broken-down flow is jammed whatever its speed (stop-and-go traffic: a phantom jam)
+to-report speed-grades-at [ m ]
+  let cs window-counts m
+  report (map [ [i c] -> section-grade i m c ] (range length sec-ids) cs)
+end
+
+;; today's commuter entries of every section (sec-ids order) at minutes m - road-window .. m - 1
+to-report window-counts [ m ]
+  let cs n-values length sec-ids [ 0 ]
+  foreach (range (m - road-window) m) [ j ->
+    let k j - grade-first-min
+    if (k >= 0) and (k < length grade-entries) [
+      foreach item k grade-entries [ en -> set cs replace-item (item 0 en) cs ((item (item 0 en) cs) + (item 1 en)) ]
+    ]
+  ]
+  report cs
+end
+
+;; Level of Service at the 5-minute mark m (cs: its window counts, from the speed-grade pass): the
+;; monitors show it, and today's "% traffic at LoS E/F" and "Mean V/C (1 = at capacity)" plots get a
+;; point at every 5-minute mark since the last one (marks that finish-day skips are computed here)
+to update-los [ m cs ]
+  if day-running? and (los-mark >= 0) [
+    let k los-mark + 5
+    while [ k < m ] [
+      plot-los k los-at k window-counts k
+      set k k + 5
+    ]
+  ]
+  let res los-at m cs
+  set los-grade item 0 res
+  set los-ef-mwy item 1 res
+  set los-ef-other item 2 res
+  set los-vc-mwy item 3 res
+  set los-vc-other item 4 res
+  set los-speed-grade item 5 res
+  set los-efs-mwy item 6 res
+  set los-efs-other item 7 res
+  set los-region-ef item 8 res
+  set los-region-vc item 9 res
+  if day-running? [ plot-los m res ]
+end
+
+;; the LoS E/F share of each region and, below it, its mean V/C, from the same pass (res of los-at):
+;; one pen per region (los-region-names); -1 = no traffic, no point
+to plot-los [ m res ]
+  set-current-plot "% traffic at LoS E/F"
+  foreach range length los-region-names [ k ->
+    set-current-plot-pen item k los-region-names
+    if (item k item 8 res) >= 0 [ plotxy (m / 60) (100 * item k item 8 res) ]
+  ]
+  set-current-plot "Mean V/C (1 = at capacity)"
+  foreach range length los-region-names [ k ->
+    set-current-plot-pen item k los-region-names
+    if (item k item 9 res) >= 0 [ plotxy (m / 60) (item k item 9 res) ]
+  ]
+  set los-mark m
+end
+
+;; Level of Service at minute m with cs[i] commuter entries of section i in the flow window, as
+;; cordonlite/roads.py (los_grade, speed_los_grade, los_at_minute): V/C x = road-volume / capacity
+;; graded in the bands of motorways or of other roads (sec-los-mwy), and the speed factor graded in the
+;; speed bands; F for a motorway in broken-down flow. The speed factor of a section not broken down is
+;; road-speed-factor's plain branch on the same x (1 / (1 + road-alpha * x4), at least road-floor: the
+;; same doubles, without computing the volume again). The share of traffic at E or F weighs each
+;; section by its volume x km. Reports [grades ef-mwy ef-other vc-mwy vc-other speed-grades efs-mwy
+;; efs-other region-ef region-vc]: shares and vehicle-km weighted mean V/C of motorways and other roads
+;; (-1 = no traffic), and the E/F share and mean V/C of each region of los-region-names
+to-report los-at [ m cs ]
+  let region-weight n-values length los-region-names [ 0 ]
+  let region-ef-weight n-values length los-region-names [ 0 ]
+  let region-x-weight n-values length los-region-names [ 0 ]
+  let wm 0
+  let em 0
+  let xm 0
+  let sm 0
+  let wo 0
+  let eo 0
+  let xo 0
+  let so 0
+  let grades []
+  let sgrades []
+  foreach range length sec-ids [ i ->
+    let v road-volume i m (item i cs)
+    let x v / (item i sec-cap)
+    let broken? road-broken? i m x
+    let g ifelse-value broken? [ 5 ] [ los-grade-of x (item i sec-los-mwy) ]
+    let gs 5
+    if not broken? [
+      let f 1 / (1 + (road-alpha * ((x * x) * (x * x))))   ;; road-speed-factor, not broken down
+      if f < road-floor [ set f road-floor ]
+      set gs speed-los-grade-of f
+    ]
+    let w v * (item i sec-km)
+    ifelse (item i sec-los-mwy) = 1 [
+      set wm wm + w
+      set xm xm + w * x
+      if g >= 4 [ set em em + w ]
+      if gs >= 4 [ set sm sm + w ]
+    ] [
+      set wo wo + w
+      set xo xo + w * x
+      if g >= 4 [ set eo eo + w ]
+      if gs >= 4 [ set so so + w ]
+    ]
+    let region-index item i sec-region
+    set region-weight replace-item region-index region-weight ((item region-index region-weight) + w)
+    set region-x-weight replace-item region-index region-x-weight ((item region-index region-x-weight) + (w * x))
+    if g >= 4 [ set region-ef-weight replace-item region-index region-ef-weight ((item region-index region-ef-weight) + w) ]
+    set grades lput g grades
+    set sgrades lput gs sgrades
+  ]
+  report (list grades (los-ratio em wm) (los-ratio eo wo) (los-ratio xm wm) (los-ratio xo wo)
+               sgrades (los-ratio sm wm) (los-ratio so wo)
+               (map [ [ef-weight weight] -> los-ratio ef-weight weight ] region-ef-weight region-weight)
+               (map [ [x-weight weight] -> los-ratio x-weight weight ] region-x-weight region-weight))
+end
+
+to-report los-ratio [ a b ]
+  report ifelse-value (b > 0) [ a / b ] [ -1 ]
+end
+
+;; LoS grade (0..5 = A..F) of V/C x: HCM 1994 bands as SSC2026 (The Congestion Question WS1, Feb 2019),
+;; motorway mainline A < 0.30, B < 0.48, C < 0.70, D < 0.90, E < 1.0, F; other roads A < 0.26, B < 0.43,
+;; C < 0.62, D < 0.82, E < 1.0, F
+to-report los-grade-of [ x mw ]
+  let bands ifelse-value (mw = 1) [ [ 0.30 0.48 0.70 0.90 1.0 ] ] [ [ 0.26 0.43 0.62 0.82 1.0 ] ]
+  let g 0
+  while [ (g < 5) and (x >= item g bands) ] [ set g g + 1 ]
+  report g
+end
+
+;; speed-based LoS grade (0..5 = A..F) of speed factor f (speed / free-flow speed): HCM 2010 urban
+;; street bands, the same on every road: A f > 0.85, B > 0.67, C > 0.50, D > 0.40, E > 0.30, F
+to-report speed-los-grade-of [ f ]
+  let bands [ 0.85 0.67 0.50 0.40 0.30 ]
+  let g 0
+  while [ (g < 5) and (f <= item g bands) ] [ set g g + 1 ]
+  report g
+end
+
+;; monitor text: % of the group's traffic at LoS E/F at the last 5-minute mark ("-" without roads)
+to-report los-ef-pct [ group ]
+  let s ifelse-value (group = "motorway") [ los-ef-mwy ] [ los-ef-other ]
+  report ifelse-value (is-number? s and s >= 0) [ 100 * s ] [ "-" ]
+end
+
+;; monitor text: % of the group's traffic at LoS E/F by speed at the last 5-minute mark
+to-report los-ef-speed-pct [ group ]
+  let s ifelse-value (group = "motorway") [ los-efs-mwy ] [ los-efs-other ]
+  report ifelse-value (is-number? s and s >= 0) [ 100 * s ] [ "-" ]
+end
+
+;; monitor text: mean V/C of the group at the last 5-minute mark
+to-report los-vc [ group ]
+  let s ifelse-value (group = "motorway") [ los-vc-mwy ] [ los-vc-other ]
+  report ifelse-value (is-number? s and s >= 0) [ s ] [ "-" ]
+end
+
+;; speed grade of the section at position i at minute m with c commuter entries in the flow window
+to-report section-grade [ i m c ]
+  if mwy-on? and road-broken? i m ((road-volume i m c) / (item i sec-cap)) [ report 3 ]
+  report speed-grade-of road-speed-factor i m c
+end
+
+;; 0 = normal (f >= 0.80), 1 = slow (0.60 <= f < 0.80), 2 = heavy (0.40 <= f < 0.60), 3 = jammed
+to-report speed-grade-of [ f ]
+  let bands grade-bands
+  let g 0
+  while [ (g < 3) and (f < item g bands) ] [ set g g + 1 ]
+  report g
+end
+
+;; today's commuter entries (today-road rows [section_id minute entries]) grouped by minute, for
+;; speed-grades-at
+to index-road-entries
+  set grade-entries []
+  set grade-first-min 0
+  if empty? today-road [ stop ]
+  let rows item 1 today-road
+  if empty? rows [ stop ]
+  set grade-first-min min map [ r -> item 1 r ] rows
+  let by-min n-values ((max map [ r -> item 1 r ] rows) - grade-first-min + 1) [ [] ]
+  foreach rows [ r ->
+    let k (item 1 r) - grade-first-min
+    set by-min replace-item k by-min (lput (list (table:get sec-index item 0 r) (item 2 r)) (item k by-min))
+  ]
+  set grade-entries by-min
+end
+
+;; gates at their crossing point. In the City centre view each corridor is labelled below its
+;; busiest gate with the number of cars waiting in its queue, by a tag turtle (the last breed, so the
+;; label is drawn above gates and cars; update-tags refreshes it every minute).
+to place-gates
+  let cc? map-view = "City centre"
+  ask gates [
+    place-at gate-x gate-y
+    set size ifelse-value cc? [ 3 ] [ 2 ]
+  ]
+  ask tags [ die ]
+  if cc? [
+    foreach corr-ids [ cid ->
+      let gs gates with [ corridor-id = cid and not hidden? ]
+      if any? gs [
+        let g max-one-of gs [ count commuters with [ my-gate = myself ] ]
+        let k table:get corr-index cid
+        ;; a label ends at its turtle; about 1.4 patches per character at this patch and font size
+        let w 1.4 * length (word cid " " corridor-entry-name item k corr-names ": 99 waiting")
+        create-tags 1 [
+          set size 0
+          set tag-cid cid
+          setxy (max (list (min-pxcor - 0.5 + w) (min (list (max-pxcor + 0.49) ([xcor] of g + w / 2)))))
+                (max (list (min-pycor - 0.5) ([ycor] of g - 3.5)))
+          set label-color white
+        ]
+      ]
+    ]
+  ]
+end
+
+;; ------------------------------------------------------------------ days
+
+;; One tick = 15 simulated seconds. The day ends when every commuter has arrived; go then stops,
+;; or with keep-going? on the next day of the days charge-on picks follows (next-day-to-show).
+to go
+  if not is-list? map-env [ user-message "Press setup first." stop ]
+  if not day-running? [
+    let d next-day-to-show
+    if is-string? d [ user-message d  stop ]
+    start-day d
+    if not day-running? [ stop ]
+  ]
+  set clock min (list day-end-min (clock + 1 / steps-per-minute))
+  update-commuters
+  update-road-colours
+  if clock >= day-end-min [ draw-pending length grade-pending ]   ;; the last frame of the day is up to date
+  plot-until clock
+  tick
+  if clock >= day-end-min [
+    end-day
+    if not keep-going? [ stop ]
+  ]
+end
+
+;; the rest of today (or the whole next day) at once, without animation
+to finish-day
+  if not is-list? map-env [ user-message "Press setup first." stop ]
+  if not day-running? [
+    let d next-day-to-show
+    if is-string? d [ user-message d  stop ]
+    start-day d
+    if not day-running? [ stop ]
+  ]
+  let skipped day-end-min - clock
+  set clock day-end-min
+  update-commuters
+  update-road-colours
+  draw-pending length grade-pending
+  plot-until clock
+  tick-advance skipped * steps-per-minute
+  display
+  end-day
+end
+
+;; The days charge-on picks, as [first last]: every day of the run, the days before the charge, or
+;; the days with it (from charge-from-day). last is the run's last day (scen-n-days), or -1 when the
+;; run's days are unknown (no scenario.csv): go then plays on. [] when the choice holds no day (a run
+;; that is never charged has no day with the charge).
+to-report days-to-show
+  if not member? charge-on [ "all days" "off: before the charge" "on: with the charge" ] [
+    error (word "unknown charge-on choice " charge-on)
+  ]
+  let lo 1
+  let hi scen-n-days
+  if (charge-on = "off: before the charge") and (charge-from-day > 0) [
+    set hi ifelse-value (hi < 0) [ charge-from-day - 1 ] [ min (list hi (charge-from-day - 1)) ]
+  ]
+  if charge-on = "on: with the charge" [
+    if charge-from-day = 0 [ report [] ]
+    set lo charge-from-day
+  ]
+  if (hi >= 0) and (hi < lo) [ report [] ]
+  report list lo hi
+end
+
+;; The day go and finish-day start next: the day after the one shown (current-day), kept inside the
+;; days charge-on picks (days-to-show). Before them it is their first day. After them it is their
+;; first day again when the day shown was not one of them (charge-on has just been changed); when the
+;; day shown was their last, they are over and no day starts. Reports the day, or the message for the
+;; user when no day starts (go and finish-day show it).
+to-report next-day-to-show
+  let s days-to-show
+  if empty? s [ report (word "This run has no days " days-words ". Pick another experiment.") ]
+  let lo item 0 s
+  let hi item 1 s
+  let d current-day + 1
+  if d < lo [ report lo ]
+  if (hi >= 0) and (d > hi) [
+    if current-day = hi [
+      report (word "Day " hi " was the last day " days-words ". Press setup to start again.")
+    ]
+    report lo
+  ]
+  report d
+end
+
+;; the days charge-on picks, in words for the user (before the charge of a run never charged: all)
+to-report days-words
+  if (charge-on = "off: before the charge") and (charge-from-day > 0) [ report "before the charge" ]
+  if charge-on = "on: with the charge" [ report "with the charge" ]
+  report "of the run"
+end
+
+to start-day [ d ]
+  let rows []
+  ifelse table:has-key? day-plans d [ set rows table:get day-plans d ] [
+    ;; a run lacks this day's plans; a folder without any plans file gets demo plans
+    if not empty? table:keys day-plans [
+      user-message (word "This run has no plans for day " d ".")
+      stop
+    ]
+    set rows demo-plans d
+  ]
+  set current-day d
+  set fee-active-today? charged-day? d
+  ask commuters [
+    set mode-today "NONE"
+    set dep -1
+    set gate-arr -1
+    set gate-exit -1
+    set arr -1
+    set q-rank 0
+  ]
+  let h first rows
+  let ia col h "agent_id"
+  let im col h "mode"
+  let idep col h "depart_min"
+  foreach but-first rows [ r ->
+    if not table:has-key? commuter-of item ia r [ error (word "unknown agent_id " item ia r) ]
+    ask table:get commuter-of item ia r [
+      set mode-today (word item im r)
+      if mode-today = "CAR" [ set dep item idep r ]
+      if mode-today = "PT" [
+        ;; PT minutes come from the run's outcomes.csv; without it a rider is at work all day
+        let key (word d " " agent-id)
+        ifelse table:has-key? pt-times key
+          [ set dep item 0 table:get pt-times key  set arr item 1 table:get pt-times key ]
+          [ set dep sim-start-min  set arr sim-start-min ]
+      ]
+    ]
+  ]
+  ;; one bus per commuter on public transport today; the commuter keeps its data and is hidden
+  ask bus-riders [ die ]
+  ask commuters with [ mode-today = "PT" ] [
+    hatch-bus-riders 1 [ set rider myself  set shape "bus"  set color green + 2  set heading 0 ]
+  ]
+  simulate-queues
+  plan-drives
+  index-road-entries
+  let cars commuters with [ mode-today = "CAR" ]
+  set n-cars count cars
+  let served cars with [ gate-exit >= 0 ]
+  let delays [ gate-exit - gate-arr ] of served
+  set mean-delay ifelse-value (empty? delays) [ 0 ] [ mean delays ]
+  set max-delay ifelse-value (empty? delays) [ 0 ] [ max delays ]
+  set day-exits [ gate-exit ] of served
+  ;; the day runs from shortly before the first departure until the last commuter has arrived (a
+  ;; car the engine never serves keeps it open to sim-end-cap-min); the tick counter counts 15-second
+  ;; steps from the start of the engine clock (sim-start-min, 05:30)
+  let movers commuters with [ dep >= 0 ]
+  let first-dep ifelse-value any? movers [ min [ dep ] of movers ] [ sim-start-min ]
+  set day-start max (list sim-start-min (15 * floor ((first-dep - 10) / 15)))
+  let ends sentence [ arr ] of commuters with [ arr >= 0 ]
+                    (ifelse-value any? cars with [ gate-exit = -1 ] [ (list sim-end-cap-min) ] [ [] ])
+  set day-end-min (max (fput (day-start + 1) ends)) + 2
+  reset-ticks
+  tick-advance (day-start - sim-start-min) * steps-per-minute
+  set clock day-start
+  set last-plot-min day-start - 1
+  set day-running? true
+  setup-day-plots
+  update-commuters
+  set grade-minute -1   ;; today's traffic: grade again at day-start
+  update-road-colours
+  plot-until clock
+end
+
+;; Today's drive of every car from home to its gate: t-out, the minute it passes each point of
+;; route-out. With road files the car follows its section times from road-arrivals (today-road): the
+;; free-flow minutes of route it covers grow at each section's congested pace, so it slows down on
+;; busy roads. The times are stretched (by about a minute at most: the engine rounds the free-flow
+;; minutes to the gate and the road delay to whole minutes) so that it reaches the gate point
+;; exactly at gate-arr, the engine's whole minute. Without a route it drives at constant speed.
+to plan-drives
+  let delays ifelse-value (empty? today-road) [ table:make ] [ item 0 today-road ]
+  let times ifelse-value (empty? today-road) [ table:make ] [ item 2 today-road ]
+  ask commuters [
+    set out-ptr 0
+    set road-delay -1
+    set t-out []
+    if mode-today = "CAR" [
+      set road-delay table:get-or-default delays agent-id 0
+      set t-out ifelse-value (table:has-key? times agent-id) [ section-clock table:get times agent-id ] [ even-clock ]
+    ]
+  ]
+end
+
+;; commuter reporter: the minute the car passes each point of route-out at constant speed by metres
+to-report even-clock
+  let total last len-out
+  report lput gate-arr butlast map [ x -> ifelse-value (total > 0) [ dep + (gate-arr - dep) * x / total ] [ dep ] ] len-out
+end
+
+;; commuter reporter: the minute the car passes each point of route-out on the section times tms of
+;; road-arrivals ([t0 .. tn], elapsed minutes at the entry of each section of its route and at the
+;; gate). A point at free-flow minutes F of the route (route-out-minutes, scaled to the route's free-flow sum)
+;; lies in the section k whose free-flow minutes span F; the car passes it at
+;; t_k + (t_k+1 - t_k) x (share of section k before it), stretched by (gate-arr - dep) / tn.
+to-report section-clock [ tms ]
+  let cum [ 0 ]   ;; free-flow minutes of the route before each section, then in all
+  foreach table:get agent-route agent-id [ i -> set cum lput ((last cum) + (item i sec-ff)) cum ]
+  let tn last tms
+  let full last route-out-minutes
+  if (tn <= 0) or (full <= 0) or (gate-arr <= dep) [ report even-clock ]
+  let stretch (gate-arr - dep) / tn
+  let scale (last cum) / full
+  let nk length cum - 2
+  let k 0         ;; the section the point lies in
+  let out (list dep)
+  foreach butlast but-first route-out-minutes [ route-point-minutes ->
+    let f route-point-minutes * scale
+    while [ (k < nk) and (item (k + 1) cum <= f) ] [ set k k + 1 ]
+    let lo item k cum
+    let span (item (k + 1) cum) - lo
+    let share ifelse-value (span > 0) [ (f - lo) / span ] [ 1 ]   ;; >= 0: lo <= f
+    if share > 1 [ set share 1 ]
+    let tk item k tms
+    let t dep + (tk + ((item (k + 1) tms) - tk) * share) * stretch
+    set out lput (ifelse-value (t < gate-arr) [ t ] [ gate-arr ]) out
+  ]
+  report lput gate-arr out
+end
+
+to end-day
+  set day-running? false
+end
+
+;; Demo plans for a folder without plans files (a synthetic folder such as the equivalence check's
+;; test scenarios): every commuter drives, departing 06:45 to 08:00 (seed 1000 + d - 1, as the earlier
+;; schematic replay GUI).
+to-report demo-plans [ d ]
+  let rows []
+  with-local-randomness [
+    random-seed 1000 + d - 1
+    set rows map [ aid -> (list aid "CAR" (405 + 15 * random 6)) ] sort table:keys agent-fg
+  ]
+  report fput [ "agent_id" "mode" "depart_min" ] rows
+end
+
+;; ------------------------------------------------------------------ engine
+
+;; Roads from home to the gate (PyEngine: cordonlite/roads.py simulate_roads, ported line by line:
+;; the same operations in the same order, so both engines compute the same numbers).
+;; cars: one [agent_id depart_min] per car today, in any order. Each car drives its route
+;; (agent-route) section by section. It enters a section at minute m = depart + floor(elapsed),
+;; with that section's speed factor at m (road-speed-factor: background flow of minute m plus the
+;; commuter entries at minutes m - road-window .. m - 1, never those of m itself, so the order of
+;; the cars within a minute does not matter), records one entry of the section at m and adds
+;; free-flow minutes / speed factor to its elapsed minutes. Road delay = floor(elapsed - free-flow
+;; sum + 0.5), at least 0; it is 0 for a car without a route and for every car when road-on? is
+;; false. Gate arrival = depart + fftt_to_gate_min (agents.csv) + road delay.
+;; Reports [delays entries times extras counts]:
+;;   delays   table agent_id -> road delay (whole minutes) of every car passed in
+;;   entries  rows [section_id minute entries] (entries > 0), by section_id, then minute
+;;            (road_dayNN.csv without the day column)
+;;   times    table agent_id -> [t0 t1 ... tn] for each car with a route of n sections: elapsed
+;;            minutes since departure when it enters each section (t0 = 0) and, last, when it
+;;            leaves the route at the gate (tn = free-flow sum + extra). Section k of the route
+;;            (position item k of agent-route) is driven from depart + t_k to depart + t_(k+1). The
+;;            engine's gate arrival is the whole minute depart + fftt_to_gate_min + road delay, so a
+;;            drawing that must reach the gate at gate-arr scales these times to it.
+;;   extras   table agent_id -> elapsed - free-flow sum (minutes, before rounding; 0 without route)
+;;   counts   table (entry-key i m) -> commuter entries of the section at position i (sec-ids
+;;            order) in minute m; road-window-count counts i m is its count in the flow window
+;;            before m (one table, not one per section: each table:make gets slower while many
+;;            tables are alive)
+to-report road-arrivals [ cars ]
+  let delays table:make
+  let extras table:make
+  let times table:make
+  foreach cars [ cr ->
+    table:put delays (item 0 cr) 0
+    table:put extras (item 0 cr) 0
+  ]
+  if not road-on? [ report (list delays [] times extras table:make) ]
+  ;; cars with a route: departure minute, elapsed minutes, next route position, free-flow sum
+  let r-dep table:make
+  let r-el table:make
+  let r-k table:make
+  let r-ffsum table:make
+  foreach cars [ cr ->
+    let aid item 0 cr
+    let rte table:get-or-default agent-route aid []
+    if not empty? rte [
+      table:put r-dep aid (item 1 cr)
+      table:put r-el aid 0
+      table:put r-k aid 0
+      let s-ff 0
+      foreach rte [ i -> set s-ff s-ff + (item i sec-ff) ]   ;; left to right, in seq order
+      table:put r-ffsum aid s-ff
+      table:put times aid [ 0 ]
+    ]
+  ]
+  let counts table:make
+  let buckets table:make   ;; minute -> agent_ids that enter their next section at that minute
+  foreach table:keys r-dep [ aid ->
+    let m0 table:get r-dep aid
+    table:put buckets m0 (lput aid (table:get-or-default buckets m0 []))
+  ]
+  let unfinished table:length r-dep
+  let m ifelse-value (unfinished > 0) [ min table:values r-dep ] [ 0 ]
+  while [ unfinished > 0 ] [
+    if table:has-key? buckets m [
+      let ids sort table:get buckets m
+      table:remove buckets m
+      foreach ids [ aid ->
+        let d0 table:get r-dep aid
+        let rte table:get agent-route aid
+        let el table:get r-el aid
+        let k table:get r-k aid
+        let tms table:get times aid
+        let done? false
+        while [ (not done?) and ((d0 + (floor el)) = m) ] [
+          let i item k rte
+          let f road-speed-factor i m (road-window-count counts i m)
+          let key entry-key i m
+          table:put counts key ((table:get-or-default counts key 0) + 1)   ;; one more entry of i at minute m
+          set el el + ((item i sec-ff) / f)
+          set k k + 1
+          set tms lput el tms
+          if k = length rte [ set done? true ]
+        ]
+        table:put r-el aid el
+        table:put r-k aid k
+        table:put times aid tms
+        ifelse done? [ set unfinished unfinished - 1 ] [
+          let nb d0 + (floor el)   ;; always a later minute
+          table:put buckets nb (lput aid (table:get-or-default buckets nb []))
+        ]
+      ]
+    ]
+    set m m + 1
+  ]
+  foreach table:keys r-dep [ aid ->
+    let xm (table:get r-el aid) - (table:get r-ffsum aid)
+    table:put extras aid xm
+    table:put delays aid (max (list 0 (floor (xm + 0.5))))
+  ]
+  let rows []
+  foreach sort table:keys counts [ key ->   ;; ascending key = by section position, then minute
+    let i floor (key / 100000)
+    set rows lput (list (item i sec-ids) (key - (i * 100000)) (table:get counts key)) rows
+  ]
+  report (list delays rows times extras counts)
+end
+
+;; key of section position i and minute m (0 <= m < 100000) in the counts table of road-arrivals
+to-report entry-key [ i m ]
+  report (i * 100000) + m
+end
+
+;; commuter entries of the section at position i at minutes m - road-window .. m - 1 (counts: the
+;; table of road-arrivals)
+to-report road-window-count [ counts i m ]
+  let c 0
+  let j m - road-window
+  while [ j < m ] [
+    set c c + (table:get-or-default counts (entry-key i j) 0)
+    set j j + 1
+  ]
+  report c
+end
+
+;; flow (veh/h) on the section at position i in minute m with c commuter entries in the flow window:
+;; background peak flow x the section's profile at minute m (the last profile minute after 23:59)
+;; + c x sec-fpe
+to-report road-volume [ i m c ]
+  let rr item i sec-r
+  let rm ifelse-value (m < 1440) [ item m rr ] [ item 1439 rr ]
+  report ((item i sec-bg) * rm) + (c * (item i sec-fpe))
+end
+
+;; speed factor (share of free-flow speed) of the section at position i in minute m with c commuter
+;; entries in the flow window: BPR with beta 4, x4 = (x * x) * (x * x) (not x ^ 4), at least road-floor.
+;; A motorway section in broken-down flow (road-broken?) runs on the BPR curve of x / (its sec-keep:
+;; 1 - its capacity drop) and at most mwy-jam (PyEngine: cordonlite/roads.py speed_factor)
+to-report road-speed-factor [ i m c ]
+  let x (road-volume i m c) / (item i sec-cap)
+  let f 1
+  ifelse mwy-on? and (road-broken? i m x) [
+    let y x / (item i sec-keep)
+    let y4 (y * y) * (y * y)
+    set f 1 / (1 + (road-alpha * y4))
+    if f > mwy-jam [ set f mwy-jam ]
+  ] [
+    let x4 (x * x) * (x * x)
+    set f 1 / (1 + (road-alpha * x4))
+  ]
+  if f < road-floor [ set f road-floor ]
+  report f
+end
+
+;; the motorway section at position i is in broken-down (stop-and-go) flow in minute m with V/C x:
+;; inside its usual-traffic breakdown window [bd-on, bd-off), or x >= mwy-vc with today's traffic
+to-report road-broken? [ i m x ]
+  report mwy-on? and ((item i sec-mwy) = 1) and
+         ((((item i sec-bd-on) <= m) and (m < (item i sec-bd-off))) or (x >= mwy-vc))
+end
+
+;; The Cordon-Lite engine: one Vickrey point queue per corridor at minute resolution (PyEngine,
+;; simulate_point_queues). arrivals: one [gate-arrival-minute agent_id corridor_id] per car. Each
+;; minute from sim-start-min, the cars that have arrived join their corridor queue (FIFO by arrival
+;; minute, then agent_id) and the corridor serves floor(carry + capacity) of them; the remainder is
+;; carried to the next minute and capped at 1 when the queue empties. It stops when every car is
+;; served or at sim-end-cap-min. Reports [exits profile last-minute]: exits = table agent_id ->
+;; gate-exit minute (a car not in it was not served); profile = rows [corridor_id minute arrivals
+;; served queue_len], corridor by corridor.
+to-report point-queues [ arrivals ]
+  let nk length corr-ids
+  let lanes n-values nk [ [] ]
+  foreach arrivals [ row ->
+    let k table:get corr-index (item 2 row)
+    set lanes replace-item k lanes (lput (list (item 0 row) (item 1 row)) (item k lanes))
+  ]
+  set lanes map [ lane0 -> sort-by [ [p q] -> ((item 0 p) < (item 0 q)) or (((item 0 p) = (item 0 q)) and ((item 1 p) < (item 1 q))) ] lane0 ] lanes
+  let n-total length arrivals
+  let arr-ptr n-values nk [ 0 ]
+  let srv-ptr n-values nk [ 0 ]
+  let carry n-values nk [ 0 ]
+  let prof n-values nk [ [] ]
+  let exits table:make
+  let served-total 0
+  let m sim-start-min
+  let done? false
+  while [ not done? ] [
+    foreach range nk [ k ->
+      let lane item k lanes
+      let ap item k arr-ptr
+      let n-arr 0
+      while [ (ap < length lane) and ((item 0 (item ap lane)) <= m) ] [
+        set ap ap + 1
+        set n-arr n-arr + 1
+      ]
+      let sp item k srv-ptr
+      let avail (item k carry) + (item k corr-caps)
+      let n min (list (ap - sp) (floor avail))
+      repeat n [
+        table:put exits (item 1 (item sp lane)) m
+        set sp sp + 1
+      ]
+      let cr avail - n
+      if sp = ap [ set cr min (list cr 1) ]
+      set carry replace-item k carry cr
+      set arr-ptr replace-item k arr-ptr ap
+      set srv-ptr replace-item k srv-ptr sp
+      set served-total served-total + n
+      set prof replace-item k prof (lput (list (item k corr-ids) m n-arr n (ap - sp)) (item k prof))
+    ]
+    ifelse (served-total = n-total) or (m >= sim-end-cap-min) [ set done? true ] [ set m m + 1 ]
+  ]
+  report (list exits (ifelse-value (nk = 0) [ [] ] [ reduce sentence prof ]) m)
+end
+
+;; today's cars on screen: gate-arr, gate-exit (-1 when not served by sim-end-cap-min) and arr, from
+;; the engine's road-arrivals and point-queues (so the same minutes as the run); today-road keeps
+;; the road-arrivals result (road delays, section entries, each car's section times)
+to simulate-queues
+  let cars sort-on [ agent-id ] commuters with [ mode-today = "CAR" ]
+  foreach cars [ c ->
+    ask c [
+      if (dep + (table:get agent-fg agent-id)) < sim-start-min [
+        error (word "agent " agent-id " reaches its gate before sim-start-min")
+      ]
+    ]
+  ]
+  set today-road road-arrivals map [ c -> [ list agent-id dep ] of c ] cars
+  let road-delays item 0 today-road
+  let arrivals []
+  foreach cars [ c ->
+    ask c [
+      set gate-arr (dep + (table:get agent-fg agent-id)) + (table:get road-delays agent-id)
+      set arrivals lput (list gate-arr agent-id corridor-id) arrivals
+    ]
+  ]
+  let exits item 0 point-queues arrivals
+  foreach cars [ c ->
+    ask c [
+      set gate-exit ifelse-value (table:has-key? exits agent-id) [ table:get exits agent-id ] [ -1 ]
+      set arr ifelse-value (gate-exit >= 0) [ gate-exit + table:get agent-gd agent-id ] [ -1 ]
+    ]
+  ]
+end
+
+;; ------------------------------------------------------------------ headless engine (NetLogoEngine)
+;; Python (cordonlite/engine.py) loads this model through pynetlogo and calls:
+;;   setup-from-dir "<dir>"            reads corridors.csv, agents.csv, fees.csv and the road files when
+;;                                     present (read-roads; no map, no network)
+;;   set-clock <sim-start> <cap>       engine clock (defaults 330 and 720)
+;;   run-day <day> "<dir>" <fee?>      reads plans_dayNN.csv, writes outcomes_dayNN.csv, profile_dayNN.csv
+;;                                     and road_dayNN.csv
+
+to setup-from-dir [ dir ]
+  clear-all
+  set scen-dir dir
+  set sim-start-min 330
+  set sim-end-cap-min 720
+  set current-day 0
+  set day-running? false
+  set fee-active-today? false
+  set n-cars 0
+  set mean-delay 0
+  set max-delay 0
+  set last-minute sim-start-min
+  set last-profile []
+  set last-exits []
+  set last-road []
+  set today-road []
+  set agent-mode table:make
+  read-corridors
+  read-agents
+  read-fees
+  read-scenario-meta
+  read-roads
+  reset-ticks
+end
+
+to set-clock [ start cap ]
+  set sim-start-min start
+  set sim-end-cap-min cap
+end
+
+to run-day [ d dir fee? ]
+  run-day-io d dir dir fee?
+end
+
+;; plans_dayNN.csv from in-dir; outcomes_dayNN.csv, profile_dayNN.csv and road_dayNN.csv (header only
+;; without road files) to out-dir
+to run-day-io [ d in-dir out-dir fee? ]
+  set current-day d
+  set fee-active-today? fee?
+  let rows read-rows in-dir (word "plans_day" pad2 d ".csv")
+  let h first rows
+  let ia col h "agent_id"
+  let im col h "mode"
+  let idep col h "depart_min"
+  let cars []       ;; [agent_id corridor_id depart]
+  set agent-mode table:make
+  foreach but-first rows [ r ->
+    let aid item ia r
+    let md (word item im r)
+    table:put agent-mode aid md
+    if md = "CAR" [
+      if not table:has-key? agent-corr aid [ error (word "unknown agent_id " aid) ]
+      let cid table:get agent-corr aid
+      let dep-min item idep r
+      ;; as PyEngine (car_rows): checked on the free-flow arrival; the road delay is never negative
+      if (dep-min + (table:get agent-fg aid)) < sim-start-min [
+        error (word "agent " aid " reaches its gate before sim-start-min")
+      ]
+      set cars lput (list aid cid dep-min) cars
+    ]
+  ]
+  ;; gate arrival = depart + free-flow minutes to the gate + road delay
+  let road-res road-arrivals map [ c -> list (item 0 c) (item 2 c) ] cars
+  let road-delays item 0 road-res
+  set cars map [ c -> (lput ((item 2 c) + (table:get agent-fg (item 0 c)) + (table:get road-delays (item 0 c))) c) ] cars
+  let arrivals map [ c -> (list (item 3 c) (item 0 c) (item 1 c)) ] cars   ;; [gate-arrival agent_id corridor_id]
+  let result point-queues arrivals
+  let exits item 0 result
+  set last-minute item 2 result
+  let out []
+  let delays []
+  let exit-list []
+  foreach sort-by [ [p q] -> (item 0 p) < (item 0 q) ] cars [ c ->
+    let aid item 0 c
+    let a item 3 c
+    let rd table:get road-delays aid
+    ifelse table:has-key? exits aid [
+      let x table:get exits aid
+      let fee ifelse-value fee? [ item x fee-list ] [ 0 ]
+      set out lput (list aid d (item 1 c) (item 2 c) rd a x (x - a) (x + table:get agent-gd aid) fee) out
+      set delays lput (x - a) delays
+      set exit-list lput x exit-list
+    ] [
+      set out lput (list aid d (item 1 c) (item 2 c) rd a -1 -1 -1 0) out
+    ]
+  ]
+  set n-cars length cars
+  set mean-delay ifelse-value (empty? delays) [ 0 ] [ mean delays ]
+  set max-delay ifelse-value (empty? delays) [ 0 ] [ max delays ]
+  set last-exits exit-list
+  set last-profile map [ row -> fput d row ] (item 1 result)
+  set last-road map [ row -> fput d row ] (item 1 road-res)
+  csv:to-file (path-join out-dir (word "outcomes_day" pad2 d ".csv"))
+    fput [ "agent_id" "day" "corridor_id" "depart_min" "road_delay_min" "gate_arrive_min" "gate_exit_min" "queue_delay_min" "arrive_min" "fee_paid" ] out
+  csv:to-file (path-join out-dir (word "profile_day" pad2 d ".csv"))
+    fput [ "day" "corridor_id" "minute" "arrivals" "served" "queue_len" ] last-profile
+  csv:to-file (path-join out-dir (word "road_day" pad2 d ".csv"))
+    fput [ "day" "section_id" "minute" "entries" ] last-road
+end
+
+;; ------------------------------------------------------------------ positions
+
+;; commuter reporter: "home" | "driving" | "queued" | "transit" (PT) | "work" at minute m
+to-report state-at [ m ]
+  if mode-today = "CAR" [
+    if m < dep [ report "home" ]
+    if m < gate-arr [ report "driving" ]
+    if (gate-exit = -1) or (m < gate-exit) [ report "queued" ]
+    if m < arr [ report "driving" ]
+    report "work"
+  ]
+  if mode-today = "PT" [
+    if m < dep [ report "home" ]
+    if m < arr [ report "transit" ]
+    report "work"
+  ]
+  report "home"
+end
+
+to update-commuters
+  rank-queues
+  ask commuters [ place-now ]
+  ask bus-riders [ place-bus-rider ]
+  update-tags
+end
+
+;; bus-rider procedure: draw today's public transport rider where its commuter is (at home before it
+;; leaves, hidden on the way, at its building after it arrives) as a bus, and hide the commuter, so each
+;; rider is drawn once
+to place-bus-rider
+  let c rider
+  setxy [xcor] of c [ycor] of c
+  set hidden? [hidden?] of c
+  set size ifelse-value (map-view = "City centre") [ 3 ] [ 2.2 ]
+  ask c [ set hidden? true ]
+end
+
+;; commuter reporter: the turtle that draws this commuter (its bus on a public transport day, else itself)
+to-report drawn-agent
+  if mode-today = "PT" [
+    let b one-of bus-riders with [ rider = myself ]
+    if b != nobody [ report b ]
+  ]
+  report self
+end
+
+;; corridor label: corridor id, the road its cars enter by and the cars waiting in its queue now
+to update-tags
+  ask tags [
+    let cid tag-cid
+    let k table:get corr-index cid
+    set label (word cid " " corridor-entry-name item k corr-names ": "
+                    count commuters with [ corridor-id = cid and state-at clock = "queued" ] " waiting")
+  ]
+end
+
+;; place in the queue at each gate: FIFO by gate arrival minute, then agent_id (the engine's order)
+to rank-queues
+  let q sort-by [ [a b] -> ([gate-arr] of a < [gate-arr] of b) or
+                           (([gate-arr] of a = [gate-arr] of b) and ([agent-id] of a < [agent-id] of b)) ]
+          commuters with [ state-at clock = "queued" ]
+  let seen table:make
+  foreach q [ c ->
+    let g [ [who] of my-gate ] of c
+    let r table:get-or-default seen g 0
+    ask c [ set q-rank r ]
+    table:put seen g (r + 1)
+  ]
+end
+
+;; commuter procedure: draw at today's position for the current clock
+to place-now
+  let s state-at clock
+  let cc? map-view = "City centre"
+  let base ifelse-value (mode-today = "PT") [ green + 2 ]
+           [ ifelse-value (mode-today = "CAR" or mode-today = "NONE") [ corridor-color corridor-id ] [ gray ] ]
+  set color base
+  if s = "transit" [ set hidden? true  stop ]
+  if s = "home" [
+    set shape "dot"
+    set size ifelse-value cc? [ 1.5 ] [ 1.2 ]
+    place-at home-x home-y
+    stop
+  ]
+  if s = "work" [
+    set shape "dot"
+    set size ifelse-value cc? [ 2 ] [ 0.8 ]
+    place-at [building-x] of work-building [building-y] of work-building
+    stop
+  ]
+  ;; on the road: driving to the gate (on its section times), queued before it (red), or driving
+  ;; from it to the building. A queued car is drawn smaller, to fit its place in the queue.
+  set shape "car"
+  ifelse s = "queued" [
+    set color red
+    set size queued-car-size cc?
+  ] [
+    set size car-size cc?
+  ]
+  let p []
+  ifelse s = "queued" [
+    set p point-along route-out len-out max (list 0 ((last len-out) - q-rank * queue-spacing-m))
+  ] [
+    ifelse clock < gate-arr [
+      set p drive-point clock
+    ] [
+      set p point-along route-in len-in
+              ifelse-value (arr > gate-exit) [ (last len-in) * (clock - gate-exit) / (arr - gate-exit) ] [ last len-in ]
+    ]
+  ]
+  place-at (item 0 p) (item 1 p)
+  set heading item 2 p
+end
+
+;; commuter reporter: [x y heading] on route-out at minute m of today's drive to the gate: between
+;; the two points it passes before and after m (t-out), at the share of that stretch's minutes gone.
+;; At gate-arr it is the gate point. out-ptr remembers the last point passed (the clock only moves on).
+to-report drive-point [ m ]
+  let n length t-out
+  if (out-ptr > 0) and (item out-ptr t-out > m) [ set out-ptr 0 ]
+  while [ (out-ptr < n - 2) and (item (out-ptr + 1) t-out <= m) ] [ set out-ptr out-ptr + 1 ]
+  let a item out-ptr route-out
+  let b item (out-ptr + 1) route-out
+  let ta item out-ptr t-out
+  let tb item (out-ptr + 1) t-out
+  let f ifelse-value (tb > ta) [ max (list 0 (min (list 1 ((m - ta) / (tb - ta))))) ] [ 1 ]
+  report (list ((item 0 a) + f * ((item 0 b) - (item 0 a)))
+               ((item 1 a) + f * ((item 1 b) - (item 1 a)))
+               (bearing-of a b))
+end
+
+;; [x y heading] at distance d (metres) along the polyline pts with cumulative lengths cum
+to-report point-along [ pts cum d ]
+  let n length pts
+  if n = 1 [ report (list (item 0 first pts) (item 1 first pts) 0) ]
+  let i 1
+  while [ (i < n - 1) and (item i cum < d) ] [ set i i + 1 ]
+  let a item (i - 1) pts
+  let b item i pts
+  let la item (i - 1) cum
+  let lb item i cum
+  let f ifelse-value (lb > la) [ max (list 0 (min (list 1 ((d - la) / (lb - la))))) ] [ 1 ]
+  report (list ((item 0 a) + f * ((item 0 b) - (item 0 a)))
+               ((item 1 a) + f * ((item 1 b) - (item 1 a)))
+               (bearing-of a b))
+end
+
+to-report bearing-of [ a b ]
+  let ddx (item 0 b) - (item 0 a)
+  let ddy (item 1 b) - (item 1 a)
+  report ifelse-value ((ddx = 0) and (ddy = 0)) [ 0 ] [ atan ddx ddy ]
+end
+
+;; ------------------------------------------------------------------ monitors and plots
+
+to-report n-state [ s ]
+  report count commuters with [ state-at clock = s ]
+end
+
+;; mean road delay (min) of today's cars that have reached their gate so far (0 before the first)
+to-report traffic-delay-now
+  let done commuters with [ mode-today = "CAR" and gate-arr >= 0 and gate-arr <= clock ]
+  report ifelse-value (any? done) [ mean [ road-delay ] of done ] [ 0 ]
+end
+
+;; plots use hours on the x-axis (7.5 = 07:30), up to the quarter hour after the day's end (a round label)
+to setup-day-plots
+  let x0 day-start
+  let x1 15 * ceiling ((max (list (x0 + 15) day-end-min)) / 15)
+  set-current-plot "Commuters"
+  clear-plot
+  set-plot-x-range (x0 / 60) (x1 / 60)
+  set-current-plot "Queue length by corridor"
+  clear-plot
+  set-plot-x-range (x0 / 60) (x1 / 60)
+  foreach range length corr-ids [ k ->
+    create-temporary-plot-pen (word item k corr-ids ": " corridor-entry-name item k corr-names)
+    set-plot-pen-color corridor-color item k corr-ids
+  ]
+  set-current-plot "% traffic at LoS E/F"   ;; a point every 5 minutes (update-los)
+  clear-plot
+  set-plot-x-range (x0 / 60) (x1 / 60)
+  set-current-plot "Mean V/C (1 = at capacity)"   ;; the same 5-minute marks
+  clear-plot
+  set-plot-x-range (x0 / 60) (x1 / 60)
+  set los-mark -1
+  set-current-plot "Cordon entries per 15 min"
+  clear-plot
+  set-plot-x-range (x0 / 60) (x1 / 60)
+  ;; charge drawn scaled so its peak equals the day's highest 15-min entry count (shape only)
+  set-current-plot-pen "charge (scaled)"
+  if fee-active-today? [
+    let counts map [ b -> length filter [ x -> (x >= b) and (x < b + 15) ] day-exits ] (range x0 x1 15)
+    let top max (fput 1 counts)
+    let fmax max (fput 0.01 sublist fee-list x0 x1)
+    foreach (range x0 x1) [ mm -> plotxy (mm / 60) (top * (item mm fee-list) / fmax) ]
+  ]
+end
+
+;; one point per whole minute up to m (a finished day is plotted in full)
+to plot-until [ m ]
+  while [ last-plot-min < floor m ] [
+    set last-plot-min last-plot-min + 1
+    let mm last-plot-min
+    let states [ state-at mm ] of commuters
+    set-current-plot "Commuters"
+    set-current-plot-pen "driving"
+    plotxy (mm / 60) length filter [ s -> s = "driving" ] states
+    set-current-plot-pen "queued"
+    plotxy (mm / 60) length filter [ s -> s = "queued" ] states
+    set-current-plot "Queue length by corridor"
+    foreach range length corr-ids [ k ->
+      let cid item k corr-ids
+      set-current-plot-pen (word cid ": " corridor-entry-name item k corr-names)
+      plotxy (mm / 60) count commuters with [ corridor-id = cid and state-at mm = "queued" ]
+    ]
+  ]
+  set-current-plot "Cordon entries per 15 min"
+  set-current-plot-pen "entries"
+  histogram map [ x -> x / 60 ] filter [ x -> x <= m ] day-exits
+end]]></code>
+  <widgets>
+    <view x="330" wrappingAllowedX="false" y="10" frameRate="30.0" minPycor="-60" height="551" showTickCounter="true" patchSize="4.5" fontSize="10" wrappingAllowedY="false" width="551" tickCounterLabel="ticks (1 tick = 15 s)" maxPycor="60" updateMode="1" maxPxcor="60" minPxcor="-60"></view>
+    <chooser x="10" y="10" height="60" variable="experiment" current="0" width="310" display="experiment">
+      <choice type="string" value="Rule, reacts to events: $6 charge"></choice>
+      <choice type="string" value="Rule, reacts to events: $18 charge"></choice>
+      <choice type="string" value="Rule, decides every day: $6 charge"></choice>
+      <choice type="string" value="Rule, decides every day: $18 charge"></choice>
+      <choice type="string" value="LLM, reacts to events: $6 charge"></choice>
+      <choice type="string" value="LLM, reacts to events: $18 charge"></choice>
+      <choice type="string" value="LLM, decides every day: $6 charge"></choice>
+      <choice type="string" value="LLM, decides every day: $18 charge"></choice>
+    </chooser>
+    <chooser x="10" y="75" height="60" variable="pt-disruption" current="0" width="310" display="pt-disruption">
+      <choice type="string" value="none"></choice>
+      <choice type="string" value="day 3 and day 8"></choice>
+    </chooser>
+    <button x="10" y="145" height="35" disableUntilTicks="false" forever="false" kind="Observer" width="150" display="setup">setup</button>
+    <button x="170" y="145" height="35" disableUntilTicks="true" forever="true" kind="Observer" width="150" display="go">go</button>
+    <switch x="10" y="185" height="40" on="false" variable="keep-going?" width="150" display="keep-going?"></switch>
+    <button x="170" y="185" height="35" disableUntilTicks="true" forever="false" kind="Observer" width="150" display="skip to end of day">finish-day</button>
+    <monitor x="10" precision="0" y="230" height="49" fontSize="11" display="day" width="150" sizeVersion="0">current-day</monitor>
+    <monitor x="170" precision="0" y="230" height="49" fontSize="11" display="time" width="150" sizeVersion="0">hhmm clock</monitor>
+    <monitor x="10" precision="0" y="285" height="49" fontSize="11" display="driving" width="95" sizeVersion="0">n-state "driving"</monitor>
+    <monitor x="115" precision="0" y="285" height="49" fontSize="11" display="in a queue" width="95" sizeVersion="0">n-state "queued"</monitor>
+    <monitor x="220" precision="0" y="285" height="49" fontSize="11" display="at work" width="100" sizeVersion="0">n-state "work"</monitor>
+    <monitor x="10" precision="0" y="340" height="49" fontSize="11" display="cars today" width="150" sizeVersion="0">n-cars</monitor>
+    <monitor x="170" precision="1" y="340" height="49" fontSize="11" display="mean queue wait (min)" width="150" sizeVersion="0">mean-delay</monitor>
+    <monitor x="10" precision="1" y="395" height="49" fontSize="11" display="traffic delay (min)" width="150" sizeVersion="0">traffic-delay-now</monitor>
+    <note x="10" y="455" backgroundDark="0" fontSize="12" width="310" markdown="false" height="360" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">1. Pick an experiment and a PT disruption and press setup (about 50 s). The experiment says who decides (a rule or an LLM), when, and the peak charge: $6 is the usual charge, $18 a higher one.
+2. Press go: one morning plays until everyone has arrived at work, then go stops. Days 1 to 5 have no charge, days 6 to 10 have it.
+3. To run day after day, switch keep-going? on before pressing go.
+4. City-centre view zooms in on the gates and the queues.
+
+Dots are commuters (colour = entry corridor, grey = works from home); green buses are commuters on public transport. Cars drive to the cordon, wait in red queues at the gates, then park at their workplace. Roads turn yellow, orange, then purple as traffic slows down. Purple motorways are in stop-and-go traffic (times from NZTA counts).</note>
+    <button x="330" y="570" height="35" disableUntilTicks="true" forever="false" kind="Observer" width="180" display="Auckland view">set-map-view "Auckland"</button>
+    <button x="520" y="570" height="35" disableUntilTicks="true" forever="false" kind="Observer" width="180" display="City-centre view">set-map-view "City centre"</button>
+    <monitor x="330" precision="1" y="615" height="49" fontSize="11" display="LoS E/F % motorways" width="180" sizeVersion="0">los-ef-pct "motorway"</monitor>
+    <monitor x="520" precision="1" y="615" height="49" fontSize="11" display="LoS E/F % other roads" width="180" sizeVersion="0">los-ef-pct "other"</monitor>
+    <monitor x="330" precision="2" y="670" height="49" fontSize="11" display="mean V/C motorways" width="180" sizeVersion="0">los-vc "motorway"</monitor>
+    <monitor x="520" precision="2" y="670" height="49" fontSize="11" display="mean V/C other roads" width="180" sizeVersion="0">los-vc "other"</monitor>
+    <monitor x="330" precision="1" y="725" height="49" fontSize="11" display="LoS E/F by speed % motorways" width="180" sizeVersion="0">los-ef-speed-pct "motorway"</monitor>
+    <monitor x="520" precision="1" y="725" height="49" fontSize="11" display="LoS E/F by speed % other roads" width="180" sizeVersion="0">los-ef-speed-pct "other"</monitor>
+    <note x="710" y="570" backgroundDark="0" fontSize="10" width="171" markdown="false" height="270" textColorDark="-1" textColorLight="-16777216" backgroundLight="0">LoS E/F: % of traffic on roads near or over capacity (level of service E or F) at the last 5-minute mark.
+
+Mean V/C: traffic divided by capacity (1 = at capacity).
+
+By speed: % of traffic at most 40% of free-flow speed or in stop-and-go (roughly the purple roads).
+
+From 07:00 nearly all traffic on other roads is at E/F, and motorways are at F in their usual jam hours: read LoS E/F together with the mean V/C.</note>
+    <plot x="890" autoPlotX="false" yMax="10.0" autoPlotY="true" yAxis="commuters" y="10" xMin="5.5" height="190" legend="true" xMax="9.0" yMin="0.0" width="430" xAxis="hour (7.5 = 07:30)" display="Commuters">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="driving" color="-13345367" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="queued" color="-2674135" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="890" autoPlotX="false" yMax="10.0" autoPlotY="true" yAxis="cars" y="205" xMin="5.5" height="200" legend="true" xMax="9.0" yMin="0.0" width="430" xAxis="hour (7.5 = 07:30)" display="Queue length by corridor">
+      <setup></setup>
+      <update></update>
+    </plot>
+    <plot x="890" autoPlotX="false" yMax="10.0" autoPlotY="true" yAxis="cars" y="410" xMin="5.5" height="200" legend="true" xMax="9.0" yMin="0.0" width="430" xAxis="hour of cordon crossing" display="Cordon entries per 15 min">
+      <setup></setup>
+      <update></update>
+      <pen interval="0.25" mode="1" display="entries" color="-13345367" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="charge (scaled)" color="-955883" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="890" autoPlotX="false" yMax="100.0" autoPlotY="false" yAxis="%" y="615" xMin="5.5" height="175" legend="true" xMax="9.0" yMin="0.0" width="430" xAxis="hour (7.5 = 07:30)" display="% traffic at LoS E/F">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="SH1" color="-14714956" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="SH16" color="-33010" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="SH20" color="-13852628" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="North Shore" color="-7051331" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="New Lynn" color="-7580085" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Green Lane" color="-1869886" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Other roads" color="-8421505" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+    <plot x="890" autoPlotX="false" yMax="2.0" autoPlotY="true" yAxis="V/C" y="795" xMin="5.5" height="175" legend="true" xMax="9.0" yMin="0.0" width="430" xAxis="hour (7.5 = 07:30)" display="Mean V/C (1 = at capacity)">
+      <setup></setup>
+      <update></update>
+      <pen interval="1.0" mode="0" display="SH1" color="-14714956" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="SH16" color="-33010" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="SH20" color="-13852628" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="North Shore" color="-7051331" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="New Lynn" color="-7580085" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Green Lane" color="-1869886" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+      <pen interval="1.0" mode="0" display="Other roads" color="-8421505" legend="true">
+        <setup></setup>
+        <update></update>
+      </pen>
+    </plot>
+  </widgets>
+  <info>## WHAT IS IT?
+
+The Cordon-Lite commuter model with every car driving on the real Auckland road network. Commuters live at their Cordon-Lite origins across Auckland and work in the city centre. Each one works in one building inside the cordon (SA3 "Auckland City Centre"), drawn at random once and kept for every day. Each morning a commuter drives (at a departure time it picks), takes public transport or works from home, as decided in the Python run. Each commuter has its own willingness to pay to drive into the city centre, and the share of commuters willing to pay falls exponentially as the charge rises; a commuter does not drive at a time when the charge is above its willingness to pay, unless it has a company car (the employer pays) or can neither take public transport nor work from home. On a replayed day a car leaves home, drives the TomTom major-road network through the morning traffic to the gate where its route enters the cordon, waits in its corridor's queue and drives on to its building.
+
+## HOW IT WORKS
+
+Road network. setup loads the TomTom major roads (`gis/tomtom_major_roads.shp`, converted from the prep GeoPackage by `python -m prep.build_netlogo_layers`) with the GIS extension and builds a node-link network the same way as the Python prep graph: a node at each segment end (NZTM rounded to 1 m), segments whose ends coincide dropped, and of parallel segments between the same two nodes the fastest kept (28,520 nodes, 30,846 roads). Only the giant component is kept, as the prep routes on it: 28,507 nodes and 30,835 roads, 1,106 nodes inside the cordon. The link weight is free-flow minutes (distance / speed limit). Nodes and links are hidden; the roads are drawn from the shapefile.
+
+Routes. A commuter's gate is the prep gate of its origin (`../data/origins.csv`, `gate_id`; found through `origin_id` in the run's personas.csv, or the origin coordinates). Its car drives the free-flow shortest path from home to the outside end of the gate segment (a prefix of the prep path) and crosses the cordon at the gate point (`../data/gates.csv`). From the inside end it takes the shortest path to the cordon node nearest its building (in the largest connected set of cordon roads), with 60 minutes added to every road that has an end outside the cordon, so that a car that has passed its gate stays inside. On plain free-flow minutes about two thirds of these legs would leave the cordon and come back. A leg still leaves where the cordon's own roads do not connect: from the Wellesley Street ramp gate (about 100 to 160 m) and from Hopetoun Street (about 180 m). The car parks at that node (median 65 m from the building, up to about 780 m for buildings on the wharves, which the major-road network does not reach), and the commuter is drawn at the building on arrival. A synthetic folder whose agents are not prep origins (such as the equivalence check's test scenarios) queues each corridor at its corridor point instead; its homes can be kilometres from any road, so its cars start with a straight line and its speeds are not meaningful. A folder without plans files gets demo plans (every commuter drives, leaving between 06:45 and 08:00), and one without scenario.csv is charged from day 11.
+
+Road traffic. A run folder made with road congestion on (road_sections.csv, agent_routes.csv, road_profile.csv and road_params.csv) splits each commuter's route to its gate into road sections. Each minute a section carries background traffic (from the AT/NZTA traffic counts, rising through the morning) plus the commuters' own cars that entered it in the last 15 minutes, each agent standing for about 20 cars (19,000 cars, 950 agents). The busier a section is for its capacity, the slower cars drive on it, so a car that leaves at 07:45 takes longer than one that leaves at 06:30, and fewer commuter cars ease the roads. This is the engine's procedure road-arrivals, the same as PyEngine, so every road delay equals the run's. Without these files (an older run folder, a synthetic folder) the roads are free-flow and the road delay is 0. The roads inside the cordon are never congested: the gate queue stands for that.
+
+Motorway breakdown. Auckland's motorways run over capacity for hours every morning, and their flow breaks down into stop-and-go traffic. In a run made with motorway breakdown on (road_params.csv `mwy_breakdown` 1), a motorway section (a motorway road of the TomTom network by class or by name, such as the Harbour Bridge, signed 70 km/h or more, not a ramp: road_sections.csv `mwy` 1) is broken down inside its usual breakdown window (`bd_on`, `bd_off`) and at any other minute when today's traffic, with the commuters' cars, reaches its capacity. Motorway jam timing comes from NZTA traffic counts: on a motorway with count sites, each section takes the window, the capacity, the morning traffic and the capacity drop that the counts of the nearest count site on the same motorway show (road_sections.csv `profile_id`, `cap_drop`; road_profile.csv has one time profile per site), so each motorway breaks down at its own time. The usual windows are: the Harbour Bridge from about 06:15 to 09:30; the Northern Motorway between Albany and Tristram Avenue from about 06:45 until about 09:30, and the Northern Motorway around Northcote from about 06:45 until 11:00; the Southern Motorway between the city and Mt Wellington from between 06:45 and 07:15 until 11:00, and the Southern Motorway south of Mt Wellington from about 07:15 until about 09:45; the Northwestern from between 06:30 and 07:15 until about 09:45. The counts around Northcote and between the city and Mt Wellington show no recovery before 11:00. Motorways with no count site of their own (the Upper Harbour Motorway and the roads to the airport) keep the default window, from about 07:10 to 10:00 (seven Upper Harbour stretches, whose capacity is raised to the minimum for their road class, jam a little later and clear at about 09:15 to 09:30). The counts at the Northwestern's city end and on the Southwestern show no breakdown, so the Northwestern's city end and the whole Southwestern break down only when today's traffic fills them. Broken-down flow loses capacity (the drop the counts show, 6% to 26%, else 10%) and moves at no more than 45% of the free-flow speed (45 km/h on a 100 km/h motorway). The usual windows come from the traffic counts, so fewer commuter cars on charged days cannot shorten them: they can only prevent the breakdowns that today's traffic starts. This is part of road-arrivals, the same as in PyEngine.
+
+Clock. The minutes are those of the Cordon-Lite engine. Gate arrival = departure + free-flow minutes to the gate (agents.csv) + road delay (whole minutes). The queue is the engine's Vickrey point queue per corridor (procedure point-queues, the same FIFO order, carry and cap as PyEngine), so every gate-exit minute equals the run's. Arrival = gate exit + free-flow minutes from the gate. Before its gate a car follows its section times from road-arrivals: it covers each section's free-flow minutes of route in the minutes the traffic gives it, so it slows down on busy sections, and it reaches the gate point exactly at its gate arrival minute (its times are stretched by about a minute at most for that, as the engine counts whole minutes). Without road files, and after the gate, a car moves along its route at constant speed. Cars are drawn every 15 simulated seconds (one tick). A day lasts until the last commuter has arrived, then the next day can start. The workplace building therefore sets where a car parks, not when it arrives: the engine's gate-to-destination minutes refer to the single prep destination, not to the building. In a 950-agent R-clock run with road congestion and motorway breakdown the implied speeds to the gate (route length / (gate arrival - departure)) are a median of 42 km/h on days 6 and 25 (5-95%: 23-72 km/h); at free flow they would be a median of 78 km/h (5-95%: 50-95 km/h). From the gate to the parking node the median is 43 km/h (5-95%: 14-77 km/h; a few short engine legs give up to about 96 km/h). Queued cars are red and are drawn back along the approach road from the gate. Each agent stands for about 20 cars (agents_represented / agents: 19,000 / 950), so each takes up about 70 m of road (7 m per car, 2 lanes): the queue on the map is as long as the real queue. A queued car is drawn smaller than a moving one so that it fits its 70 m and the cars of a queue stand apart; in the Auckland view a whole queue is only a few patches long, so its cars still overlap there.
+
+Road colours. The road sections on the commuters' routes are drawn a little wider than other roads and coloured by how fast their traffic moves at the last 5-minute mark, as a share of the free-flow speed (the engine's speed for a car entering the section at that minute): 80% or more keeps the grey of the road, 60-80% (slow) is light yellow, 40-60% (heavy) orange and below 40% (jammed) purple. A motorway section in broken-down flow is purple whatever its speed: it is in stop-and-go traffic. The slower the traffic, the wider the line. Red stays for queued cars and green for public transport, and the three road colours differ from the colours of the corridors' cars. The segments of each section come from `../data/section_segments.csv` (python -m prep.build_roads). Every 5 minutes only the sections whose colour changed are redrawn, at most 60 per tick, so when many roads change at once (about 07:25, 08:05, 08:45 and 09:15 to 09:20) the map catches up over a few simulated minutes; switching the view redraws the whole map at once.
+
+Level of service. Below the map, the LoS monitors and plots grade the road sections on the commuters' routes at the last 5-minute mark, as the Python run does (cordonlite/roads.py): by V/C, today's traffic divided by capacity, in the HCM 1994 bands that SSC2026 used (E from 0.90 on motorways and 0.82 on other roads, F from 1.0; a broken-down motorway is F), and by speed (E or F at 40% of free-flow speed or less). "LoS E/F" is the share of traffic (vehicle-km) at E or F, and the mean V/C, weighted the same way, is shown beside it in monitors and in the plot under the LoS plot. The two plots draw one line for each road group (SH1, SH16, SH20, North Shore, New Lynn, Green Lane and all other roads), while the monitors show motorways and other roads as a whole. Read the two together, because the V/C grade saturates. The capacity of the other roads is a scale fitted to the TomTom congestion index (about 0.077 times the daily traffic count), not a lane capacity, so from 07:00 about 99% of their traffic is at E or F. On motorways about 76% of the vehicle-km is inside the usual breakdown windows, which are graded F whatever the flow.
+
+PT riders are drawn as green buses (breed bus-riders, one per commuter on public transport that day): they leave home at their PT departure minute and appear at their building at their PT arrival minute (outcomes.csv of the run; without it they are at work all day). WFH commuters work from home: they stay at home all morning.
+
+Workplaces. One building per commuter, drawn uniformly from the 1,484 building points inside the cordon (`gis/cbd_buildings.csv`, one point inside each footprint) with a fixed seed, in agent_id order, so a replay always shows the same workplaces.
+
+## HOW TO USE IT
+
+1. Pick an experiment and a PT disruption (none, day 3 or day 8) and press setup (about 50 s).
+2. Press go. go plays the days of the run from day 1 to its last (10 days: the first five without the charge, the last five with it, from charge_from_day in its scenario.csv). One morning plays until everyone has arrived at work, and go stops. One tick is 15 simulated seconds.
+3. To run day after day, switch keep-going? on before pressing go. go stops after day 10, the last day of the run.
+4. skip to end of day jumps to the end of the morning without animation. Auckland view and City-centre view switch the map; the City-centre view shows the gates and their queues best. The NetLogo speed slider sets the pace.
+
+The experiments in the experiment chooser: four ways the commuters decide, each at two peak charges. Who decides is a rule or an LLM. When: "reacts to events" means a commuter keeps its plan and thinks again only when something happens to it, such as the charge starting (day 6), a late arrival, a public transport disruption or a car trip that took much longer than expected (R-clock and L-clock in the Python runs); "decides every day" means every commuter decides afresh every day (R-daily and L-daily). The $6 experiments have the usual peak charge of NZ$6 and the $18 experiments NZ$18 instead, both charged from day 6: each run has 10 days, the first five without the charge and the last five with it (seed 1). Compare charges on the same days of each experiment, such as days 6 to 10. The PT disruption chooser adds two disruptions, on day 3 (before the charge) and on day 8 (with it): on each of these days the public transport time on one corridor (South-east, Alten Road and Parnell Rise: the corridor with the most commuters who can take public transport) doubles; it is announced that morning, and commuters who use public transport there think again that day and the next. Neither falls on the day the charge starts (day 6); "none" has no disruption. The commuters' behaviour was calibrated with the NZ$6 charge. An experiment whose run is not on this computer must first be made with python -m cordonlite.run (setup says so).
+
+The monitors: "traffic delay (min)" is the mean delay on the roads of today's cars that have reached their gate so far; "mean queue wait (min)" is today's mean wait at the gates. The LoS E/F and mean V/C monitors and plots show how close the roads are to capacity (Level of service above).
+
+## THINGS TO NOTICE
+
+There are two kinds of congestion: traffic on the roads into the city centre and the queue at each cordon gate. The motorways go first: the Harbour Bridge turns purple (stop-and-go) at about 06:15, the rest of the Northern Motorway at about 06:45, the Southern Motorway between 06:45 and 07:15, most of the Northwestern between 06:30 and 07:15 and the motorways without a count site of their own (the Upper Harbour Motorway and the roads to the airport) at about 07:10, so by about 07:15 most motorways on the commuters' routes are purple. The Northwestern's city end and the whole Southwestern have no usual window: parts of them turn purple only when today's traffic fills them, mostly between about 07:40 and 08:30. The Harbour Bridge and the Northern Motorway between Albany and Tristram Avenue clear at about 09:30, the Northwestern and the Southern Motorway south of Mt Wellington at about 09:45, the motorways without a count site of their own at about 10:00, while the Northern Motorway around Northcote and the Southern Motorway between the city and Mt Wellington stay purple after 10:00 (their counts show no recovery before 11:00). On the other roads, at 07:30 most of the commuters' roads are yellow (slow), from about 08:05 most are orange (heavy) and the busiest approaches purple (jammed), at 09:00 most are yellow again and by 09:45 most are grey. Cars leaving in those hours slow down on the way, most of all on the motorways, and the "traffic delay (min)" monitor climbs. Watch the red queues grow behind the gates around 08:00 and the "waiting" counts in the City-centre view, before and after the charge starts; on charged days fewer cars drive in the peak, fewer motorways break down early, fewer roads turn orange or purple and the traffic delay is lower. The plots use hours on the x-axis (7.5 = 07:30). On charged days the entries plot shows the charge, scaled so that its peak equals the highest bar.
+
+## PYTHON ENGINE
+
+This is also the engine Python drives headless (NetLogoEngine, `python -m cordonlite.run --engine netlogo`): it calls setup-from-dir, set-clock and run-day, which load no map and write outcomes_dayNN.csv, profile_dayNN.csv and road_dayNN.csv into the run folder. Watching a run in the GUI writes nothing.
+
+## CREDITS AND REFERENCES
+
+Vickrey, W.S. (1969) Congestion theory and transport investment. American Economic Review 59(2), 251-260.
+Part of Cordon-Lite (Hyesop Shin and Milad Malekzadeh, CUPUM 2027). Road network: TomTom major roads. Buildings: LINZ building outlines inside the SA3 Auckland City Centre.
+Motorway counts: Traffic counts sourced from the New Zealand Transport Agency (NZTA Waka Kotahi) Traffic Monitoring System via the NZTA Open Data portal, licensed for re-use under CC BY 4.0 (https://creativecommons.org/licenses/by/4.0/).</info>
+  <turtleShapes>
+    <shape name="default" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="5"></point>
+        <point x="40" y="250"></point>
+        <point x="150" y="205"></point>
+        <point x="260" y="250"></point>
+      </polygon>
+    </shape>
+    <shape name="airplane" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="135" y="15"></point>
+        <point x="120" y="60"></point>
+        <point x="120" y="105"></point>
+        <point x="15" y="165"></point>
+        <point x="15" y="195"></point>
+        <point x="120" y="180"></point>
+        <point x="135" y="240"></point>
+        <point x="105" y="270"></point>
+        <point x="120" y="285"></point>
+        <point x="150" y="270"></point>
+        <point x="180" y="285"></point>
+        <point x="210" y="270"></point>
+        <point x="165" y="240"></point>
+        <point x="180" y="180"></point>
+        <point x="285" y="195"></point>
+        <point x="285" y="165"></point>
+        <point x="180" y="105"></point>
+        <point x="180" y="60"></point>
+        <point x="165" y="15"></point>
+      </polygon>
+    </shape>
+    <shape name="arrow" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="0"></point>
+        <point x="0" y="150"></point>
+        <point x="105" y="150"></point>
+        <point x="105" y="293"></point>
+        <point x="195" y="293"></point>
+        <point x="195" y="150"></point>
+        <point x="300" y="150"></point>
+      </polygon>
+    </shape>
+    <shape name="box" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="285"></point>
+        <point x="285" y="225"></point>
+        <point x="285" y="75"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="135"></point>
+        <point x="15" y="75"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="75"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="75"></point>
+        <point x="15" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="150" y="135"></point>
+      </polygon>
+      <line endX="150" startY="285" marked="false" color="255" endY="135" startX="150"></line>
+      <line endX="15" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+      <line endX="285" startY="135" marked="false" color="255" endY="75" startX="150"></line>
+    </shape>
+    <shape name="bug" rotatable="true" editableColorIndex="0">
+      <circle x="96" y="182" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="110" y="127" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <circle x="110" y="75" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <line endX="80" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+      <line endX="220" startY="100" marked="true" color="-1920102913" endY="30" startX="150"></line>
+    </shape>
+    <shape name="bus" rotatable="false" editableColorIndex="0">
+      <rectangle endX="285" startY="75" marked="true" color="-1920102913" endY="210" startX="15" filled="true"></rectangle>
+      <rectangle endX="70" startY="95" marked="false" color="-1" endY="140" startX="35" filled="true"></rectangle>
+      <rectangle endX="120" startY="95" marked="false" color="-1" endY="140" startX="85" filled="true"></rectangle>
+      <rectangle endX="170" startY="95" marked="false" color="-1" endY="140" startX="135" filled="true"></rectangle>
+      <rectangle endX="220" startY="95" marked="false" color="-1" endY="140" startX="185" filled="true"></rectangle>
+      <rectangle endX="270" startY="95" marked="false" color="-1" endY="185" startX="240" filled="true"></rectangle>
+      <circle x="45" y="180" marked="false" color="255" diameter="55" filled="true"></circle>
+      <circle x="200" y="180" marked="false" color="255" diameter="55" filled="true"></circle>
+    </shape>
+    <shape name="butterfly" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="209" y="199"></point>
+        <point x="225" y="225"></point>
+        <point x="225" y="255"></point>
+        <point x="195" y="270"></point>
+        <point x="165" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="165"></point>
+        <point x="89" y="198"></point>
+        <point x="75" y="225"></point>
+        <point x="75" y="255"></point>
+        <point x="105" y="270"></point>
+        <point x="135" y="255"></point>
+        <point x="150" y="240"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="139" y="148"></point>
+        <point x="100" y="105"></point>
+        <point x="55" y="90"></point>
+        <point x="25" y="90"></point>
+        <point x="10" y="105"></point>
+        <point x="10" y="135"></point>
+        <point x="25" y="180"></point>
+        <point x="40" y="195"></point>
+        <point x="85" y="194"></point>
+        <point x="139" y="163"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="162" y="150"></point>
+        <point x="200" y="105"></point>
+        <point x="245" y="90"></point>
+        <point x="275" y="90"></point>
+        <point x="290" y="105"></point>
+        <point x="290" y="135"></point>
+        <point x="275" y="180"></point>
+        <point x="260" y="195"></point>
+        <point x="215" y="195"></point>
+        <point x="162" y="165"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="135" y="225"></point>
+        <point x="120" y="150"></point>
+        <point x="135" y="120"></point>
+        <point x="150" y="105"></point>
+        <point x="165" y="120"></point>
+        <point x="180" y="150"></point>
+        <point x="165" y="225"></point>
+      </polygon>
+      <circle x="135" y="90" marked="false" color="255" diameter="30" filled="true"></circle>
+      <line endX="195" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+      <line endX="105" startY="105" marked="false" color="255" endY="60" startX="150"></line>
+    </shape>
+    <shape name="car" rotatable="true" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="180" y="15"></point>
+        <point x="164" y="21"></point>
+        <point x="144" y="39"></point>
+        <point x="135" y="60"></point>
+        <point x="132" y="74"></point>
+        <point x="106" y="87"></point>
+        <point x="84" y="97"></point>
+        <point x="63" y="115"></point>
+        <point x="50" y="141"></point>
+        <point x="50" y="165"></point>
+        <point x="60" y="225"></point>
+        <point x="150" y="285"></point>
+        <point x="165" y="285"></point>
+        <point x="225" y="285"></point>
+        <point x="225" y="15"></point>
+        <point x="180" y="15"></point>
+      </polygon>
+      <circle x="180" y="30" marked="false" color="255" diameter="90" filled="true"></circle>
+      <circle x="180" y="180" marked="false" color="255" diameter="90" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="80" y="138"></point>
+        <point x="78" y="168"></point>
+        <point x="135" y="166"></point>
+        <point x="135" y="91"></point>
+        <point x="105" y="106"></point>
+        <point x="96" y="111"></point>
+        <point x="89" y="120"></point>
+      </polygon>
+      <circle x="195" y="195" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+      <circle x="195" y="47" marked="true" color="-1920102913" diameter="58" filled="true"></circle>
+    </shape>
+    <shape name="circle" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="circle 2" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+    </shape>
+    <shape name="cow" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="200" y="193"></point>
+        <point x="197" y="249"></point>
+        <point x="179" y="249"></point>
+        <point x="177" y="196"></point>
+        <point x="166" y="187"></point>
+        <point x="140" y="189"></point>
+        <point x="93" y="191"></point>
+        <point x="78" y="179"></point>
+        <point x="72" y="211"></point>
+        <point x="49" y="209"></point>
+        <point x="48" y="181"></point>
+        <point x="37" y="149"></point>
+        <point x="25" y="120"></point>
+        <point x="25" y="89"></point>
+        <point x="45" y="72"></point>
+        <point x="103" y="84"></point>
+        <point x="179" y="75"></point>
+        <point x="198" y="76"></point>
+        <point x="252" y="64"></point>
+        <point x="272" y="81"></point>
+        <point x="293" y="103"></point>
+        <point x="285" y="121"></point>
+        <point x="255" y="121"></point>
+        <point x="242" y="118"></point>
+        <point x="224" y="167"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="73" y="210"></point>
+        <point x="86" y="251"></point>
+        <point x="62" y="249"></point>
+        <point x="48" y="208"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="25" y="114"></point>
+        <point x="16" y="195"></point>
+        <point x="9" y="204"></point>
+        <point x="23" y="213"></point>
+        <point x="25" y="200"></point>
+        <point x="39" y="123"></point>
+      </polygon>
+    </shape>
+    <shape name="cylinder" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+    </shape>
+    <shape name="dot" rotatable="false" editableColorIndex="0">
+      <circle x="90" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+    </shape>
+    <shape name="face happy" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="255"></point>
+        <point x="90" y="239"></point>
+        <point x="62" y="213"></point>
+        <point x="47" y="191"></point>
+        <point x="67" y="179"></point>
+        <point x="90" y="203"></point>
+        <point x="109" y="218"></point>
+        <point x="150" y="225"></point>
+        <point x="192" y="218"></point>
+        <point x="210" y="203"></point>
+        <point x="227" y="181"></point>
+        <point x="251" y="194"></point>
+        <point x="236" y="217"></point>
+        <point x="212" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="face neutral" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="7" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <rectangle endX="240" startY="195" marked="false" color="255" endY="225" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="face sad" rotatable="false" editableColorIndex="0">
+      <circle x="8" y="8" marked="true" color="-1920102913" diameter="285" filled="true"></circle>
+      <circle x="60" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <circle x="180" y="75" marked="false" color="255" diameter="60" filled="true"></circle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="150" y="168"></point>
+        <point x="90" y="184"></point>
+        <point x="62" y="210"></point>
+        <point x="47" y="232"></point>
+        <point x="67" y="244"></point>
+        <point x="90" y="220"></point>
+        <point x="109" y="205"></point>
+        <point x="150" y="198"></point>
+        <point x="192" y="205"></point>
+        <point x="210" y="220"></point>
+        <point x="227" y="242"></point>
+        <point x="251" y="229"></point>
+        <point x="236" y="206"></point>
+        <point x="212" y="183"></point>
+      </polygon>
+    </shape>
+    <shape name="fish" rotatable="false" editableColorIndex="0">
+      <polygon color="-1" filled="true" marked="false">
+        <point x="44" y="131"></point>
+        <point x="21" y="87"></point>
+        <point x="15" y="86"></point>
+        <point x="0" y="120"></point>
+        <point x="15" y="150"></point>
+        <point x="0" y="180"></point>
+        <point x="13" y="214"></point>
+        <point x="20" y="212"></point>
+        <point x="45" y="166"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="135" y="195"></point>
+        <point x="119" y="235"></point>
+        <point x="95" y="218"></point>
+        <point x="76" y="210"></point>
+        <point x="46" y="204"></point>
+        <point x="60" y="165"></point>
+      </polygon>
+      <polygon color="-1" filled="true" marked="false">
+        <point x="75" y="45"></point>
+        <point x="83" y="77"></point>
+        <point x="71" y="103"></point>
+        <point x="86" y="114"></point>
+        <point x="166" y="78"></point>
+        <point x="135" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="136"></point>
+        <point x="151" y="77"></point>
+        <point x="226" y="81"></point>
+        <point x="280" y="119"></point>
+        <point x="292" y="146"></point>
+        <point x="292" y="160"></point>
+        <point x="287" y="170"></point>
+        <point x="270" y="195"></point>
+        <point x="195" y="210"></point>
+        <point x="151" y="212"></point>
+        <point x="30" y="166"></point>
+      </polygon>
+      <circle x="215" y="106" marked="false" color="255" diameter="30" filled="true"></circle>
+    </shape>
+    <shape name="flag" rotatable="false" editableColorIndex="0">
+      <rectangle endX="75" startY="15" marked="true" color="-1920102913" endY="300" startX="60" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="90" y="150"></point>
+        <point x="270" y="90"></point>
+        <point x="90" y="30"></point>
+      </polygon>
+      <line endX="90" startY="135" marked="true" color="-1920102913" endY="135" startX="75"></line>
+      <line endX="90" startY="45" marked="true" color="-1920102913" endY="45" startX="75"></line>
+    </shape>
+    <shape name="flower" rotatable="false" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="135" y="120"></point>
+        <point x="165" y="165"></point>
+        <point x="180" y="210"></point>
+        <point x="180" y="240"></point>
+        <point x="150" y="300"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="240"></point>
+        <point x="195" y="195"></point>
+        <point x="165" y="135"></point>
+      </polygon>
+      <circle x="85" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="147" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="192" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="85" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="40" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="177" y="132" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="70" y="85" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="130" y="25" marked="true" color="-1920102913" diameter="38" filled="true"></circle>
+      <circle x="96" y="51" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="113" y="68" marked="false" color="255" diameter="74" filled="true"></circle>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="189" y="233"></point>
+        <point x="219" y="188"></point>
+        <point x="249" y="173"></point>
+        <point x="279" y="188"></point>
+        <point x="234" y="218"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="180" y="255"></point>
+        <point x="150" y="210"></point>
+        <point x="105" y="210"></point>
+        <point x="75" y="240"></point>
+        <point x="135" y="240"></point>
+      </polygon>
+    </shape>
+    <shape name="house" rotatable="false" editableColorIndex="0">
+      <rectangle endX="255" startY="120" marked="true" color="-1920102913" endY="285" startX="45" filled="true"></rectangle>
+      <rectangle endX="180" startY="210" marked="false" color="255" endY="285" startX="120" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="15" y="120"></point>
+        <point x="150" y="15"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+      <line endX="270" startY="120" marked="false" color="255" endY="120" startX="30"></line>
+    </shape>
+    <shape name="leaf" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="210"></point>
+        <point x="135" y="195"></point>
+        <point x="120" y="210"></point>
+        <point x="60" y="210"></point>
+        <point x="30" y="195"></point>
+        <point x="60" y="180"></point>
+        <point x="60" y="165"></point>
+        <point x="15" y="135"></point>
+        <point x="30" y="120"></point>
+        <point x="15" y="105"></point>
+        <point x="40" y="104"></point>
+        <point x="45" y="90"></point>
+        <point x="60" y="90"></point>
+        <point x="90" y="105"></point>
+        <point x="105" y="120"></point>
+        <point x="120" y="120"></point>
+        <point x="105" y="60"></point>
+        <point x="120" y="60"></point>
+        <point x="135" y="30"></point>
+        <point x="150" y="15"></point>
+        <point x="165" y="30"></point>
+        <point x="180" y="60"></point>
+        <point x="195" y="60"></point>
+        <point x="180" y="120"></point>
+        <point x="195" y="120"></point>
+        <point x="210" y="105"></point>
+        <point x="240" y="90"></point>
+        <point x="255" y="90"></point>
+        <point x="263" y="104"></point>
+        <point x="285" y="105"></point>
+        <point x="270" y="120"></point>
+        <point x="285" y="135"></point>
+        <point x="240" y="165"></point>
+        <point x="240" y="180"></point>
+        <point x="270" y="195"></point>
+        <point x="240" y="210"></point>
+        <point x="180" y="210"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="195"></point>
+        <point x="135" y="240"></point>
+        <point x="120" y="255"></point>
+        <point x="105" y="255"></point>
+        <point x="105" y="285"></point>
+        <point x="135" y="285"></point>
+        <point x="165" y="240"></point>
+        <point x="165" y="195"></point>
+      </polygon>
+    </shape>
+    <shape name="line" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="300" startX="150"></line>
+    </shape>
+    <shape name="line half" rotatable="true" editableColorIndex="0">
+      <line endX="150" startY="0" marked="true" color="-1920102913" endY="150" startX="150"></line>
+    </shape>
+    <shape name="pentagon" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="15"></point>
+        <point x="15" y="120"></point>
+        <point x="60" y="285"></point>
+        <point x="240" y="285"></point>
+        <point x="285" y="120"></point>
+      </polygon>
+    </shape>
+    <shape name="person" rotatable="false" editableColorIndex="0">
+      <circle x="110" y="5" marked="true" color="-1920102913" diameter="80" filled="true"></circle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="120" y="195"></point>
+        <point x="90" y="285"></point>
+        <point x="105" y="300"></point>
+        <point x="135" y="300"></point>
+        <point x="150" y="225"></point>
+        <point x="165" y="300"></point>
+        <point x="195" y="300"></point>
+        <point x="210" y="285"></point>
+        <point x="180" y="195"></point>
+        <point x="195" y="90"></point>
+      </polygon>
+      <rectangle endX="172" startY="79" marked="true" color="-1920102913" endY="94" startX="127" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="195" y="90"></point>
+        <point x="240" y="150"></point>
+        <point x="225" y="180"></point>
+        <point x="165" y="105"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="105" y="90"></point>
+        <point x="60" y="150"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="105"></point>
+      </polygon>
+    </shape>
+    <shape name="plant" rotatable="false" editableColorIndex="0">
+      <rectangle endX="165" startY="90" marked="true" color="-1920102913" endY="300" startX="135" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="255"></point>
+        <point x="90" y="210"></point>
+        <point x="45" y="195"></point>
+        <point x="75" y="255"></point>
+        <point x="135" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="255"></point>
+        <point x="210" y="210"></point>
+        <point x="255" y="195"></point>
+        <point x="225" y="255"></point>
+        <point x="165" y="285"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="180"></point>
+        <point x="90" y="135"></point>
+        <point x="45" y="120"></point>
+        <point x="75" y="180"></point>
+        <point x="135" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="180"></point>
+        <point x="165" y="210"></point>
+        <point x="225" y="180"></point>
+        <point x="255" y="120"></point>
+        <point x="210" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="105"></point>
+        <point x="90" y="60"></point>
+        <point x="45" y="45"></point>
+        <point x="75" y="105"></point>
+        <point x="135" y="135"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="165" y="105"></point>
+        <point x="165" y="135"></point>
+        <point x="225" y="105"></point>
+        <point x="255" y="45"></point>
+        <point x="210" y="60"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="135" y="90"></point>
+        <point x="120" y="45"></point>
+        <point x="150" y="15"></point>
+        <point x="180" y="45"></point>
+        <point x="165" y="90"></point>
+      </polygon>
+    </shape>
+    <shape name="square" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+    </shape>
+    <shape name="square 2" rotatable="false" editableColorIndex="0">
+      <rectangle endX="270" startY="30" marked="true" color="-1920102913" endY="270" startX="30" filled="true"></rectangle>
+      <rectangle endX="240" startY="60" marked="false" color="255" endY="240" startX="60" filled="true"></rectangle>
+    </shape>
+    <shape name="star" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="151" y="1"></point>
+        <point x="185" y="108"></point>
+        <point x="298" y="108"></point>
+        <point x="207" y="175"></point>
+        <point x="242" y="282"></point>
+        <point x="151" y="216"></point>
+        <point x="59" y="282"></point>
+        <point x="94" y="175"></point>
+        <point x="3" y="108"></point>
+        <point x="116" y="108"></point>
+      </polygon>
+    </shape>
+    <shape name="target" rotatable="false" editableColorIndex="0">
+      <circle x="0" y="0" marked="true" color="-1920102913" diameter="300" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <circle x="60" y="60" marked="true" color="-1920102913" diameter="180" filled="true"></circle>
+      <circle x="90" y="90" marked="false" color="255" diameter="120" filled="true"></circle>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+    </shape>
+    <shape name="tree" rotatable="false" editableColorIndex="0">
+      <circle x="118" y="3" marked="true" color="-1920102913" diameter="94" filled="true"></circle>
+      <rectangle endX="180" startY="195" marked="false" color="-1653716737" endY="300" startX="120" filled="true"></rectangle>
+      <circle x="65" y="21" marked="true" color="-1920102913" diameter="108" filled="true"></circle>
+      <circle x="116" y="41" marked="true" color="-1920102913" diameter="127" filled="true"></circle>
+      <circle x="45" y="90" marked="true" color="-1920102913" diameter="120" filled="true"></circle>
+      <circle x="104" y="74" marked="true" color="-1920102913" diameter="152" filled="true"></circle>
+    </shape>
+    <shape name="triangle" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+    </shape>
+    <shape name="triangle 2" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="150" y="30"></point>
+        <point x="15" y="255"></point>
+        <point x="285" y="255"></point>
+      </polygon>
+      <polygon color="255" filled="true" marked="false">
+        <point x="151" y="99"></point>
+        <point x="225" y="223"></point>
+        <point x="75" y="224"></point>
+      </polygon>
+    </shape>
+    <shape name="truck" rotatable="false" editableColorIndex="0">
+      <rectangle endX="195" startY="45" marked="true" color="-1920102913" endY="187" startX="4" filled="true"></rectangle>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="296" y="193"></point>
+        <point x="296" y="150"></point>
+        <point x="259" y="134"></point>
+        <point x="244" y="104"></point>
+        <point x="208" y="104"></point>
+        <point x="207" y="194"></point>
+      </polygon>
+      <rectangle endX="195" startY="60" marked="false" color="-1" endY="105" startX="195" filled="true"></rectangle>
+      <polygon color="255" filled="true" marked="false">
+        <point x="238" y="112"></point>
+        <point x="252" y="141"></point>
+        <point x="219" y="141"></point>
+        <point x="218" y="112"></point>
+      </polygon>
+      <circle x="234" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <rectangle endX="214" startY="185" marked="true" color="-1920102913" endY="194" startX="181" filled="true"></rectangle>
+      <circle x="144" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="false" color="255" diameter="42" filled="true"></circle>
+      <circle x="24" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="144" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+      <circle x="234" y="174" marked="true" color="-1920102913" diameter="42" filled="false"></circle>
+    </shape>
+    <shape name="turtle" rotatable="true" editableColorIndex="0">
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="215" y="204"></point>
+        <point x="240" y="233"></point>
+        <point x="246" y="254"></point>
+        <point x="228" y="266"></point>
+        <point x="215" y="252"></point>
+        <point x="193" y="210"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="195" y="90"></point>
+        <point x="225" y="75"></point>
+        <point x="245" y="75"></point>
+        <point x="260" y="89"></point>
+        <point x="269" y="108"></point>
+        <point x="261" y="124"></point>
+        <point x="240" y="105"></point>
+        <point x="225" y="105"></point>
+        <point x="210" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="105" y="90"></point>
+        <point x="75" y="75"></point>
+        <point x="55" y="75"></point>
+        <point x="40" y="89"></point>
+        <point x="31" y="108"></point>
+        <point x="39" y="124"></point>
+        <point x="60" y="105"></point>
+        <point x="75" y="105"></point>
+        <point x="90" y="105"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="132" y="85"></point>
+        <point x="134" y="64"></point>
+        <point x="107" y="51"></point>
+        <point x="108" y="17"></point>
+        <point x="150" y="2"></point>
+        <point x="192" y="18"></point>
+        <point x="192" y="52"></point>
+        <point x="169" y="65"></point>
+        <point x="172" y="87"></point>
+      </polygon>
+      <polygon color="1504722175" filled="true" marked="false">
+        <point x="85" y="204"></point>
+        <point x="60" y="233"></point>
+        <point x="54" y="254"></point>
+        <point x="72" y="266"></point>
+        <point x="85" y="252"></point>
+        <point x="107" y="210"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="119" y="75"></point>
+        <point x="179" y="75"></point>
+        <point x="209" y="101"></point>
+        <point x="224" y="135"></point>
+        <point x="220" y="225"></point>
+        <point x="175" y="261"></point>
+        <point x="128" y="261"></point>
+        <point x="81" y="224"></point>
+        <point x="74" y="135"></point>
+        <point x="88" y="99"></point>
+      </polygon>
+    </shape>
+    <shape name="wheel" rotatable="false" editableColorIndex="0">
+      <circle x="3" y="3" marked="true" color="-1920102913" diameter="294" filled="true"></circle>
+      <circle x="30" y="30" marked="false" color="255" diameter="240" filled="true"></circle>
+      <line endX="150" startY="285" marked="true" color="-1920102913" endY="15" startX="150"></line>
+      <line endX="285" startY="150" marked="true" color="-1920102913" endY="150" startX="15"></line>
+      <circle x="120" y="120" marked="true" color="-1920102913" diameter="60" filled="true"></circle>
+      <line endX="79" startY="40" marked="true" color="-1920102913" endY="269" startX="216"></line>
+      <line endX="269" startY="84" marked="true" color="-1920102913" endY="221" startX="40"></line>
+      <line endX="269" startY="216" marked="true" color="-1920102913" endY="79" startX="40"></line>
+      <line endX="221" startY="40" marked="true" color="-1920102913" endY="269" startX="84"></line>
+    </shape>
+    <shape name="x" rotatable="false" editableColorIndex="0">
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="270" y="75"></point>
+        <point x="225" y="30"></point>
+        <point x="30" y="225"></point>
+        <point x="75" y="270"></point>
+      </polygon>
+      <polygon color="-1920102913" filled="true" marked="true">
+        <point x="30" y="75"></point>
+        <point x="75" y="30"></point>
+        <point x="270" y="225"></point>
+        <point x="225" y="270"></point>
+      </polygon>
+    </shape>
+  </turtleShapes>
+  <linkShapes>
+    <shape name="default" curviness="0.0">
+      <lines>
+        <line x="-0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+        <line x="0.0" visible="true">
+          <dash value="1.0"></dash>
+          <dash value="0.0"></dash>
+        </line>
+        <line x="0.2" visible="false">
+          <dash value="0.0"></dash>
+          <dash value="1.0"></dash>
+        </line>
+      </lines>
+      <indicator>
+        <shape name="link direction" rotatable="true" editableColorIndex="0">
+          <line endX="90" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+          <line endX="210" startY="150" marked="true" color="-1920102913" endY="180" startX="150"></line>
+        </shape>
+      </indicator>
+    </shape>
+  </linkShapes>
+  <previewCommands>need-to-manually-make-preview-for-this-model</previewCommands>
+</model>

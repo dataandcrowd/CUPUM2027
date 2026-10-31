@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AKL Cordon: watch a morning</title>
+<meta name="description" content="Replay any morning of the simulation on the map and follow one commuter through the whole experiment.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/core.js" defer></script>
+<script src="assets/pages.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <div class="eyebrow">Watch a morning<span class="live quiet">Live replay</span></div>
+  <h1>Every commuter, every minute, every morning</h1>
+  <p class="lede">This is the simulation replayed exactly as it happened. Cars move along their real routes at the speed the model gave them, wait at the gate as long as the queue held them, and pay the charge in force when they cross. <b>Click any dot to meet that person.</b></p>
+
+  <div class="ctls">
+    <label class="ctl">Scenario <select id="rp-scn"><option value="">The charge begins on morning 6</option><option value="_pt">Same, but trains and buses on the South-west side take twice as long on mornings 3 and 8</option></select></label>
+    <label class="ctl">Who decides <select id="rp-arms"><option value="rclock,hclock">Formula (left) vs AI (right)</option><option value="rdaily,rclock">Formula every day vs formula only when woken</option><option value="rdaily,rclock,hclock">All three side by side</option></select></label>
+  </div>
+  <div class="panel"><div id="rp-replay"></div></div>
+  <div class="try"><b>Try this:</b> pick morning 5 (the last free morning), press Play, and watch the queues at 8 am. Then pick morning 6 and play it again. Switch the scenario to the train disruption and watch morning 8 on the AI side: the former drivers go back to their cars.</div>
+
+  <div class="panel" id="rp-agent-panel">
+    <p class="panel-title">Meet a commuter</p>
+    <p class="panel-sub">Click a dot on a map, or type a number from 0 to 949. The strip shows what this person did on each of the ten mornings, once with the formula deciding and once with the AI. The reasons underneath are copied straight from the simulation's logs: the formula's sentence, and the AI's answer in its own words.</p>
+    <div class="ctls"><label class="ctl">Commuter number <input type="number" id="rp-agent" min="0" max="949" value="6" style="width:100px"></label><button id="rp-random">Someone at random</button><button id="rp-differ">Someone the formula and the AI disagree about</button></div>
+    <div class="split">
+      <div class="personacard" id="rp-persona"></div>
+      <div><div id="rp-strip"></div><div id="rp-reasons"></div></div>
+    </div>
+  </div>
+
+  <div class="grid2">
+    <div class="panel"><p class="panel-title">How many cars are queuing at the gates</p><p class="panel-sub">Minute by minute on the chosen morning, all gates together. Most of the morning's delay actually happens on the roads before the gate; the queue is the last straw.</p><div class="chart" id="rp-queue"></div></div>
+    <div class="panel"><p class="panel-title">Cars entering the city centre</p><p class="panel-sub">In real cars (20 per dot), per 15 minutes. The grey band is the NZ$6 hour.</p><div class="chart" id="rp-cross"></div></div>
+  </div>
+  <footer class="foot"></footer>
+</main>
+</body>
+</html>

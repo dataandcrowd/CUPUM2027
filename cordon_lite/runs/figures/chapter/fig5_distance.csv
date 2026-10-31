@@ -1,0 +1,13 @@
+arm,cond,band,road,share
+Rule (R-clock),Before the charge (days 2–5),0–10 km,3.810082872928177,93.54005167958657
+Rule (R-clock),Before the charge (days 2–5),10–20 km,7.608150470219436,84.8404255319149
+Rule (R-clock),Before the charge (days 2–5),20+ km,11.57442748091603,70.05347593582889
+Rule (R-clock),NZ$6 peak (days 6–10),0–10 km,2.7340501792114695,72.09302325581395
+Rule (R-clock),NZ$6 peak (days 6–10),10–20 km,6.240329218106996,64.62765957446808
+Rule (R-clock),NZ$6 peak (days 6–10),20+ km,9.01747572815534,55.080213903743314
+LLM (H-clock),Before the charge (days 2–5),0–10 km,3.8200138985406533,92.95865633074936
+LLM (H-clock),Before the charge (days 2–5),10–20 km,7.574484944532488,83.9095744680851
+LLM (H-clock),Before the charge (days 2–5),20+ km,11.492277992277993,69.25133689839572
+LLM (H-clock),NZ$6 peak (days 6–10),0–10 km,2.6421780466724285,59.79328165374677
+LLM (H-clock),NZ$6 peak (days 6–10),10–20 km,6.585457979225684,56.32978723404255
+LLM (H-clock),NZ$6 peak (days 6–10),20+ km,9.775510204081632,47.165775401069524

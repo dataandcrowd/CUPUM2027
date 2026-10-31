@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AKL Cordon: what happens when Auckland charges drivers?</title>
+<meta name="description" content="A living simulation of 950 Auckland commuters facing a new city-centre charge. Watch them decide, then run it yourself.">
+<link rel="stylesheet" href="assets/site.css">
+<script src="assets/core.js" defer></script>
+<script src="assets/pages.js" defer></script>
+</head>
+<body>
+<main class="page">
+  <div class="hero">
+    <div>
+      <div class="eyebrow">An interactive exhibit · Auckland, 2026</div>
+      <h1>What happens when a city starts charging drivers?</h1>
+      <p class="lede">Auckland is planning to charge cars that enter the city centre in the morning rush. Nobody knows exactly how 19,000 commuters will react. So we built a small city of simulated commuters, gave them a charge, and watched. Then we did it again with an AI deciding for each of them.</p>
+    </div>
+    <div class="hero-aside">
+      <b>Everything here is real and running</b>
+      The maps replay the actual simulation, minute by minute. The numbers are recomputed from the run files. And on the <a href="run.html">Try it yourself</a> page the full model runs inside your browser, no installation needed.
+    </div>
+  </div>
+
+  <div class="tiles" id="hero-tiles">
+    <div class="tile"><b>950</b><span>simulated commuters. Each one stands for 20 real cars, so together they are the 19,000 cars that enter the city centre in the charged morning hours.</span></div>
+    <div class="tile"><b>10</b><span>mornings in a row. Five with no charge, then five with a NZ$6 peak charge at the city-centre boundary.</span></div>
+    <div class="tile"><b>23</b><span>entry points (gates) on the boundary of the city centre, the “cordon”. Cars queue there like at a toll gate.</span></div>
+    <div class="tile"><b>2</b><span>kinds of brain. Half the experiments use a formula to decide; the other half ask an AI language model what a person like this would do.</span></div>
+  </div>
+
+  <section>
+    <h2>The big idea: people don't decide every day</h2>
+    <div class="prose">
+      <p>Think about your own commute. You don't weigh up every option each morning; you do what you did yesterday. You only stop and rethink when something changes: a new charge appears, you keep arriving late, the train is cancelled.</p>
+      <p>Most traffic models forget this. They make every simulated person decide afresh every day with a formula. This model gives each commuter a <b>cognitive clock</b>: an alarm that only goes off when something worth thinking about happens. The rest of the time, habit runs the show. That is what makes it cheap enough to put an AI inside: on an ordinary morning, nobody needs to think at all.</p>
+    </div>
+    <div class="panel" id="flow"></div>
+    <ol class="steps">
+      <li><b>Look at the options</b> Each commuter can drive (leaving at one of several times), take the bus or train, or, if their job allows, work from home. For each option they know roughly how long it takes, what it costs and when they'd arrive.</li>
+      <li><b>Does the alarm go off?</b> Six things can wake a commuter: it's the first day, the charge changed, they were late yesterday, their train was disrupted, the drive was much slower than expected, or their usual choice is no longer possible.</li>
+      <li><b>Decide, if woken</b> Either a formula picks the cheapest option (counting time as money), or an AI reads a plain-language description of the person and situation and answers like that person would, giving a reason.</li>
+      <li><b>Drive the morning</b> Cars travel along real Auckland roads, slow down where traffic is heavy, queue at the gate, and arrive. Bus and train trips take a fixed time.</li>
+      <li><b>Remember</b> How long it took, how late they were, what they paid. Tomorrow's alarm and tomorrow's options use this memory.</li>
+    </ol>
+  </section>
+
+  <section>
+    <h2>Watch a charged morning unfold<span class="live quiet">Live replay</span></h2>
+    <p class="prose">This is morning 8, two days after the charge began. On the left, commuters whose decisions were made by the formula. On the right, the same 950 people, same homes, same jobs, but with the AI deciding. Blue and orange dots are cars on the road, red dots are cars queuing at a gate, green rings are people on the bus or train. <b>Click any dot to meet that commuter.</b></p>
+    <div class="panel"><div id="hero-replay"></div></div>
+    <div class="try"><b>Try this:</b> press Play, then switch to “City centre” to see the queues form at the gates. Compare how many red dots pile up on each side.</div>
+    <div class="grid2">
+      <div class="panel" id="hero-chart-cars"><p class="panel-title">How many cars cross into the city centre, morning 8</p><p class="panel-sub">Counted in real cars (20 per dot) in each 15-minute slot. The grey band is 8 to 9 am, when the charge is highest.</p><div class="chart" id="c-cross"></div></div>
+      <div class="panel"><p class="panel-title">How people travelled on each of the ten mornings</p><p class="panel-sub">Blue is driving, green is bus or train, yellow is working from home. The dashed line marks the first morning with the charge.</p><div class="grid2"><div class="chart" id="c-mode-r"></div><div class="chart" id="c-mode-h"></div></div></div>
+    </div>
+  </section>
+
+  <section>
+    <h2>Same city, same charge, two different stories</h2>
+    <div class="tiles" id="result-tiles"></div>
+    <div class="prose">
+      <p>The formula-driven commuters mostly kept driving but <b>left earlier</b> to dodge the peak price, creating a brand-new traffic peak before 7:30. The AI-driven commuters mostly <b>switched to the bus or train</b> and kept their usual departure time. Both reactions cleared the roads by about the same amount for those who kept driving.</p>
+      <p>Neither is “the truth”. The formula was tuned to match what happened in Stockholm when it introduced a charge; the AI was not tuned at all. The point of the exhibit is to see <em>how</em> two different kinds of decision-maker reach their answers, and what a city should prepare for either way. See <a href="results.html">What we found</a>.</p>
+    </div>
+  </section>
+
+  <section>
+    <h2>Explore the exhibit</h2>
+    <div class="cards">
+      <a class="card" href="model.html"><b>How it works</b><span>Meet the commuters, see how the alarm works, and play with the cost of every option for any one of the 950 people.</span></a>
+      <a class="card" href="replay.html"><b>Watch a morning</b><span>Replay any of the ten mornings on the map, follow one person through the whole experiment, and read the reasons they gave.</span></a>
+      <a class="card" href="run.html"><b>Try it yourself</b><span>Run the real model in your browser. Make the charge NZ$30, cancel the trains, change the people. See what happens.</span></a>
+      <a class="card" href="results.html"><b>What we found</b><span>The findings of the study, with the charts recomputed live from the simulation files.</span></a>
+      <a class="card" href="reference.html"><b>Under the hood</b><span>For the curious and the technical: the formulas, the parameters, the files, and how to reproduce every number.</span></a>
+    </div>
+  </section>
+  <footer class="foot"></footer>
+</main>
+</body>
+</html>
